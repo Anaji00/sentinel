@@ -321,6 +321,12 @@ class RecommendationEngine:
                         screened_out["moves with an idea already on its side"] = \
                             screened_out.get("moves with an idea already on its side", 0) + 1
                         continue
+                    # At most three a side from one industry or return cluster on a horizon's list (events are catalyst-led and exempt).
+                    # A cap change on the idea list (not B1), approved by the owner on 13 Nov 2026 (decision 10 of the list answered 'complete all').
+                    if h != EVENT_HORIZON and rc.group_is_full([sector_of.get(k["ticker"]) for k in kept[c["direction"]]],
+                                                               sector_of.get(c["ticker"])):
+                        screened_out["industry or theme cap (3 a side)"] = screened_out.get("industry or theme cap (3 a side)", 0) + 1
+                        continue
                     kept[c["direction"]].append(c)
                     kept_returns[c["direction"]].append(rets)
             plans[h] = kept[1] + kept[-1]
@@ -393,9 +399,9 @@ class RecommendationEngine:
                     # calibration was fitted on (portfolio_lab.alpha_calibration);
                     # the forecast volatility prices the risk around it.
                     news_bps = await news_read(t, px["day"][-1]) if h == "weekly" else None
-                    a = er.with_events(er.calibrated(er.alpha(ic, rc.realized_vol(px["close"], CALIBRATION_VOL_WINDOW),
-                                                              er.z_of(idea.get("percentile")), hd),
-                                                     h, calib.get(h)),
+                    raw_alpha = er.alpha(ic, rc.realized_vol(px["close"], CALIBRATION_VOL_WINDOW),
+                                         er.z_of(idea.get("percentile")), hd)
+                    a = er.with_events(er.calibrated(raw_alpha, h, calib.get(h)),
                                        active_bps.get(t, []) + ([news_bps] if news_bps else []))
                     if a is not None and a * idea["direction"] < 0:
                         # The forecast runs against the rank's side: events outweigh the
@@ -426,6 +432,10 @@ class RecommendationEngine:
                     plan = rc.stock_plan(idea["direction"], price, rc.atr(px["high"], px["low"], px["close"]), hd,
                                          round(a * 1e4, 1) if a is not None else expected)
                     forecast = {"expected_excess_bps": round(a * 1e4, 1) if a is not None else None,
+                                # The model's own score before calibration, and whether calibration put this stock on a flat stretch
+                                # of the measured map (every stock there gets one forecast): additive, nothing else reads them.
+                                "raw_alpha_bps": round(raw_alpha * 1e4, 1) if raw_alpha is not None else None,
+                                "calibration_flat": er.on_plateau(raw_alpha, calib.get(h)),
                                 "vol_annual": round(sigma, 4) if sigma else None,
                                 "prob_beats_spy": round(er.prob_beats(a, sigma, hd), 3) if a is not None and sigma else None,
                                 "stock_weight": size["weight"],

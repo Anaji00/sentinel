@@ -50,20 +50,23 @@
   /* The one hero figure on a card meant to be read across a room: a trade
      idea's expected move. Nothing else uses it. */
   --text-display: 34px;
+  /* The single figure a screen is built around: the book against the market on Today. */
+  --text-hero: clamp(2.25rem, 1.6rem + 2vw, 3.25rem);
 
   /* 1,200 class names across the panels say `cyan-*` for "interactive" or
      "selected". Repointing the scale at the accent recolours them in one
      place; renaming each would be 1,200 edits saying the same thing. */
-  --color-cyan-100: #e0e6ff;
-  --color-cyan-200: #c7d0ff;
-  --color-cyan-300: #a9b6ff;
-  --color-cyan-400: #8b9dff;
-  --color-cyan-500: #6d80f5;
-  --color-cyan-600: #5566dd;
-  --color-cyan-700: #4350b5;
-  --color-cyan-800: #343f8c;
-  --color-cyan-900: #272f66;
-  --color-cyan-950: #1a1f45;
+  /* The accent scale is mixed from the one accent token, so it follows the theme and one edit recolours it. */
+  --color-cyan-100: color-mix(in oklch, var(--accent) 14%, white);
+  --color-cyan-200: color-mix(in oklch, var(--accent) 28%, white);
+  --color-cyan-300: color-mix(in oklch, var(--accent) 52%, white);
+  --color-cyan-400: color-mix(in oklch, var(--accent) 78%, white);
+  --color-cyan-500: var(--accent);
+  --color-cyan-600: color-mix(in oklch, var(--accent) 84%, black);
+  --color-cyan-700: color-mix(in oklch, var(--accent) 66%, black);
+  --color-cyan-800: color-mix(in oklch, var(--accent) 50%, black);
+  --color-cyan-900: color-mix(in oklch, var(--accent) 36%, var(--bg-base));
+  --color-cyan-950: color-mix(in oklch, var(--accent) 22%, var(--bg-base));
 
   --radius-panel: var(--radius);
   --shadow-panel: var(--shadow-panel-value);
@@ -162,7 +165,7 @@
 
     /* Mono is for figures, tickers and identifiers -- things read by column,
        compared digit by digit, or copied exactly. Prose is set in sans. */
-    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --font-mono: var(--font-jb), ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   }
 
   :root {
@@ -227,7 +230,29 @@
   .font-mono,
   table,
   [data-numeric] {
-    font-variant-numeric: tabular-nums;
+    font-variant-numeric: tabular-nums slashed-zero;
+    /* The open-digit and single-storey-a alternates are for prose; in a column they make 0, 6 and 8 harder to tell apart. */
+    font-feature-settings: "zero" 1, "tnum" 1;
+  }
+
+  /* A toggle that is on looks on. Range buttons, Above/Below and Compare were announced to screen readers as pressed
+     but drawn identically to the ones that were not. Color is not the only cue: the selected one is also bolder. */
+  button[aria-pressed="true"] {
+    background-color: var(--accent-dim);
+    border-color: var(--border-accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* No one-word last lines in titles; prose wraps evenly where the browser can. */
+  h1,
+  h2,
+  h3,
+  .panel-title {
+    text-wrap: balance;
+  }
+  p {
+    text-wrap: pretty;
   }
 }
 
@@ -450,3 +475,17 @@
 }
 .flash-up { animation: flash-up 900ms ease-out; border-radius: 4px; }
 .flash-down { animation: flash-down 900ms ease-out; border-radius: 4px; }
+
+/* People who ask for more contrast get firmer panel edges and readable secondary text. */
+@media (prefers-contrast: more) {
+  :root {
+    --border-subtle: rgba(160, 174, 200, 0.45);
+    --border-strong: rgba(160, 174, 200, 0.7);
+    --text-muted: var(--text-secondary);
+  }
+  :root[data-theme="light"] {
+    --border-subtle: rgba(30, 42, 70, 0.4);
+    --border-strong: rgba(30, 42, 70, 0.65);
+    --text-muted: var(--text-secondary);
+  }
+}

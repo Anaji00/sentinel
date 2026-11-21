@@ -26,6 +26,7 @@ Pure: books, sizing, account value and prices in; target shares and orders out.
 from __future__ import annotations
 
 import math
+from datetime import date, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -297,7 +298,12 @@ def liquidity_capped(plan: Plan, price: float, adv_usd: Optional[float], max_par
     if plan.reason not in ("open", "add", "flip-open") or not adv_usd or adv_usd <= 0 or price <= 0:
         return plan
     cap = math.floor(max_participation * adv_usd / price * 10 ** QTY_DECIMALS) / 10 ** QTY_DECIMALS
-    return Plan(plan.symbol, min(plan.qty, cap), plan.side, plan.reason) if cap < plan.qty else plan
+    if cap >= plan.qty:
+        return plan
+    # A short is whole shares only (the venue refuses a fractional short sale, and enough refusals halt the book): a sell that opens or adds
+    # is floored to a whole share, and a cap under one share leaves a zero-quantity plan that the caller drops (review F5, 18 Nov 2026).
+    qty = float(math.floor(cap)) if plan.side == "sell" else cap
+    return Plan(plan.symbol, qty, plan.side, plan.reason)
 
 
 def limit_price(side: str, ref: float, offset: float) -> float:
@@ -341,6 +347,33 @@ def execution_halt(sent: int, failed: int, max_fail_share: float, min_orders: in
     return None
 
 
-__all__ = ["B1_LONG", "B1_SHORT_MAX", "REBALANCE_SESSIONS", "b1_book", "rebalance_due", "INDEX_FUNDS", "MIN_ORDER_USD", "Plan", "plan_orders", "without_unshortable", "target_shares", "target_weights", "unplaced",
+MAX_SESSIONS_BEHIND = 2      # the factor engine's own catch-up threshold (CATCH_UP_SESSIONS)
+
+
+def weekdays_between(as_of: date, today: date) -> int:
+    """Weekdays strictly after `as_of` and strictly before `today`: the sessions that must have completed since the scores' date, read from the
+    calendar and not from the bars table the model itself runs on (senior review F12, 19 Nov 2026: if bar ingestion for everything stops, SPY stops
+    with it and a count of SPY days after `as_of` stays at 0 while the market moves on). A market holiday counts as a session here, so around a
+    holiday this can read one more than the truth: a transient, safe-direction halt."""
+    n, d = 0, as_of + timedelta(days=1)
+    while d < today:
+        if d.weekday() < 5:
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def scores_too_old(sessions_after: Optional[int], limit: int = MAX_SESSIONS_BEHIND) -> Optional[str]:
+    """Why orders should wait because the model's scores miss completed sessions, or None. `sessions_after` is the number of completed
+    sessions after the report's as-of date; None means it could not be determined, which is not a pass: seven nightly runs published the
+    same 6 Nov scores while 96 to 147 orders a day were placed on them (13 Nov 2026)."""
+    if sessions_after is None:
+        return "the model's score date could not be read"
+    if sessions_after >= limit:
+        return f"model scores are {sessions_after} completed sessions behind"
+    return None
+
+
+__all__ = ["MAX_SESSIONS_BEHIND", "scores_too_old", "weekdays_between", "B1_LONG", "B1_SHORT_MAX", "REBALANCE_SESSIONS", "b1_book", "rebalance_due", "INDEX_FUNDS", "MIN_ORDER_USD", "Plan", "plan_orders", "without_unshortable", "target_shares", "target_weights", "unplaced",
            "whole_share_leg", "alert_risk_weights", "cap_weights", "execution_halt", "limit_price", "liquidity_capped", "picks_only",
            "safety_halts"]

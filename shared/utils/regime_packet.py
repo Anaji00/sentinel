@@ -56,7 +56,20 @@ class Verdict:
     basis: str = "measured"
 
     def as_dict(self) -> Dict[str, object]:
-        return {"label": self.label, "action": self.action, "reasons": self.reasons, "missing": self.missing, "basis": self.basis}
+        return {"label": self.label, "action": self.action, "reasons": self.reasons, "missing": self.missing, "basis": self.basis, **action_fields(self.action)}
+
+
+# Directional actions that no measurement supports yet: the follow-up study of these alerts found no continuation or reversal at 1 or 5 sessions, and a
+# five-date check of the labels (layer audit 18 Nov, finding 4) cannot confirm them. A label only: which alerts fire and their tier are unchanged.
+UNSUPPORTED_ACTIONS = frozenset({"fade_buy", "fade_sell", "go_long", "go_short"})
+
+
+def action_fields(action: object) -> Dict[str, object]:
+    """`action_supported` and a plain `action_label` for display, to sit beside the unchanged `action` (readers and tests keep reading `action`)."""
+    a = str(action or "")
+    if a in UNSUPPORTED_ACTIONS:
+        return {"action_supported": False, "action_label": "direction not established: no measured edge after such gaps"}
+    return {"action_supported": True, "action_label": a.replace("_", " ")}
 
 
 def classify(p: Packet) -> Verdict:
@@ -109,4 +122,4 @@ def classify(p: Packet) -> Verdict:
                    ["no adverse filing, surprise or catalyst found", f"residual of {p.residual_z:+.1f} sigma against peers"])
 
 
-__all__ = ["CROWDED_NO_EDGE", "CONFIRMED_CATALYST_DRIFT", "FUNDAMENTAL_IMPAIRMENT_TRAP", "LABELS", "Packet", "UNEXPLAINED_DISLOCATION", "Verdict", "classify"]
+__all__ = ["UNSUPPORTED_ACTIONS", "action_fields", "CROWDED_NO_EDGE", "CONFIRMED_CATALYST_DRIFT", "FUNDAMENTAL_IMPAIRMENT_TRAP", "LABELS", "Packet", "UNEXPLAINED_DISLOCATION", "Verdict", "classify"]

@@ -34,6 +34,7 @@ from shared.kafka import Topics  # noqa: E402
 from shared.models import Entity, EntityType, EventType, NormalizedEvent, RawEvent  # noqa: E402
 from shared.models.events import FilingData  # noqa: E402
 from shared.utils.beneficial import filed_at, filing_date, headline, is_common_equity, parse_schedule, score_schedule  # noqa: E402
+from shared.utils.collector_metrics import for_service as _collector_metrics  # noqa: E402
 from shared.utils.quiet_failures import dropped, swallowed  # noqa: E402
 
 logger = logging.getLogger("collector.filings.beneficial")
@@ -116,6 +117,7 @@ async def poll_once(session: aiohttp.ClientSession, producer: Any, raw: Any, gra
                 await raw.sadd(SEEN_KEY, acc)
                 dropped("collector_filings.beneficial_unlisted", "subject company has no listed ticker",
                         logger, detail=group["subject"][0][:60])
+                _collector_metrics("collector-filings").rejected("beneficial_unlisted")
                 continue
             base = group["link"].rsplit("/", 1)[0]
             try:
@@ -128,10 +130,12 @@ async def poll_once(session: aiohttp.ClientSession, producer: Any, raw: Any, gra
             await raw.sadd(SEEN_KEY, acc)
             if not parsed:
                 dropped("collector_filings.beneficial_unparsed", "no structured primary_doc.xml", logger)
+                _collector_metrics("collector-filings").rejected("beneficial_unparsed")
                 continue
             if not is_common_equity(parsed.get("class_title", ""), ticker):
                 dropped("collector_filings.beneficial_not_common", "stake in a preferred or note class",
                         logger, detail=f"{ticker} {parsed.get('class_title', '')[:40]}")
+                _collector_metrics("collector-filings").rejected("beneficial_not_common")
                 continue
             pair = f"{group['filer'][1]}:{group['subject'][1]}"
             prev_raw = await raw.hget(LAST_PCT_KEY, pair)

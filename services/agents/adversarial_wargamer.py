@@ -442,9 +442,10 @@ class AdversarialWargamerAgent(SentinelAgent):
         for entity_id in primary_entity_ids:
             try:
                 rows = await self.neo4j.query("""
-                    MATCH (a:Entity {id: $id})-[r*1..3]-(b:Entity)
+                    MATCH (a) WHERE a.name = $id AND (a:Company OR a:Entity OR a:Index OR a:Commodity OR a:CryptoAsset)
+                    MATCH (a)-[r*1..3]-(b)
                     WHERE ALL(rel in r WHERE coalesce(rel.weight, 1.0) >= 0.60)
-                    RETURN a.id as src, type(r[-1]) as rel, b.id as tgt LIMIT 15
+                    RETURN a.name as src, type(r[-1]) as rel, coalesce(b.name, b.id) as tgt LIMIT 15
                 """, {"id": str(entity_id).upper()})
                 for r in rows:
                     extracted_edges.append(f"({r['src']})-[:{r['rel']}]->({r['tgt']})")

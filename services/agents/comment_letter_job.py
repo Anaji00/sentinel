@@ -79,6 +79,11 @@ class CommentLetterJob:
         self._calls: List[float] = []
 
     async def run(self) -> None:
+        # Off with COMMENT_LETTER_JOB=0. It spent 13% of hosted tokens (276k in 7 days) and has stored no feature row since 11 Jun 2026; the
+        # feature is not a live-model input. Its stored rows and history are kept; turning the flag back on resumes it.
+        if os.getenv("COMMENT_LETTER_JOB", "1").strip().lower() in ("0", "false", "off", "no"):
+            logger.info("Comment-letter job off: COMMENT_LETTER_JOB is set to off.")
+            return
         await asyncio.sleep(1200)
         async with aiohttp.ClientSession() as session:
             from shared.utils.ollama import OllamaClient

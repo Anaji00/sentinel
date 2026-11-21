@@ -2,6 +2,7 @@
 Run in agents-heavy in the background: docker exec -w /app sentinel-agents-heavy python /tmp/scr.py > out.txt"""
 import asyncio
 import bisect
+import sys
 import collections
 import math
 import statistics
@@ -20,11 +21,30 @@ LAG_DAYS = 14
 MIN_CROWDED_UNITS = 30
 
 
+def unit_key(hname, known_at):
+    """5-day units are one week; 30-day units are blocks of 35 calendar days, so consecutive units do not share returns (DTC-1)."""
+    return known_at.isocalendar()[:2] if hname == "5d" else known_at.toordinal() // 35
+
+
+def paired_t(c, u):
+    """Paired t over the units that contain both crowded and uncrowded episodes (context only, not the bar)."""
+    both = [k for k in c if k in u]
+    if len(both) < 5:
+        return None, len(both)
+    d = [c[k] - u[k] for k in both]
+    sd = statistics.stdev(d)
+    return (statistics.fmean(d) / (sd / math.sqrt(len(d))) if sd > 0 else 0.0), len(both)
+
+
 def welch(a, b):
     if len(a) < 2 or len(b) < 2:
         return 0.0
     va, vb = statistics.variance(a) / len(a), statistics.variance(b) / len(b)
     return (statistics.fmean(a) - statistics.fmean(b)) / math.sqrt(va + vb) if va + vb > 0 else 0.0
+
+
+TRADABLE = "--tradable" in sys.argv       # DTC-2: only instruments that pass G4's gate at the signal (dollar volume) and today (shortable, easy to borrow)
+LIMIT = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 0
 
 
 async def main() -> None:
@@ -40,6 +60,14 @@ async def main() -> None:
     by_inst = collections.defaultdict(list)
     for e in eps:
         by_inst[e.instrument].append(e)
+    if LIMIT:
+        by_inst = collections.defaultdict(list, dict(list(by_inst.items())[:LIMIT]))
+    asset_meta = {}
+    if TRADABLE:
+        from shared.utils.asset_universe import load_asset_meta
+        from shared.utils.tradable_cells import instrument_ok
+        asset_meta = await load_asset_meta(redis.raw)
+        print(f"tradable-only run: asset metadata for {len(asset_meta)} instruments", flush=True)
     print(f"episodes {len(eps)} | instruments {len(by_inst)} | {time.time() - t0:.0f}s", flush=True)
     si = collections.defaultdict(list)
     for r in await db.query("SELECT upper(ticker) AS t, settlement_date, days_to_cover FROM short_interest WHERE days_to_cover IS NOT NULL ORDER BY settlement_date"):
@@ -65,15 +93,25 @@ async def main() -> None:
             continue
         bench = se.merge_daily(await eng._daily_series("SPY", daily_since), await eng._series("SPY", since - timedelta(days=1)))
         marks = [e.known_at.timestamp() for e in inst_eps]
+        dv = await eng._dollar_volume(inst, min(since, first) - timedelta(days=45)) if TRADABLE else None
         for hname in HORIZON_NAMES:
             h = HORIZONS[hname]
             stats = scaled_horizon_stats(series, h, marks)
             for e in inst_eps:
+                if TRADABLE:
+                    if dv is None:
+                        continue
+                    k = bisect.bisect_right(dv[0], e.known_at.timestamp())
+                    window = list(dv[1][max(0, k - 30):k])
+                    adv = sum(window) / len(window) if window else None
+                    ok, _why = instrument_ok(adv, e.direction, asset_meta.get(inst))
+                    if not ok:
+                        continue
                 d = dtc(inst, e.known_at)
                 m = measure(e, h, series, bench, stats)
                 if d is None or m is None:
                     continue
-                cells[(e.family, hname, d >= CROWDED)][e.known_at.isocalendar()[:2]].append(m.abnormal * m.direction)
+                cells[(e.family, hname, d >= CROWDED)][unit_key(hname, e.known_at)].append(m.abnormal * m.direction)
         done += 1
         if done % 1500 == 0:
             print(f"  {done} instruments, {time.time() - t0:.0f}s", flush=True)
@@ -95,7 +133,8 @@ async def main() -> None:
                 if len(cc) < 5 or len(uu) < 5 or (statistics.fmean(cc) - statistics.fmean(uu)) * diff <= 0:
                     agree = False
             met = diff <= -0.005 and abs(t) >= 2 and agree
-            print(f"{fam:28s} {hname:3s} {len(cv):5d} {len(uv):6d}  {statistics.fmean(cv) * 1e4:+7.0f} {statistics.fmean(uv) * 1e4:+7.0f} {diff * 1e4:+7.0f}  t={t:+.2f}  {'yes' if agree else 'no '}  {'CROWDING EFFECT' if met else 'no effect shown'}")
+            pt, pn = paired_t(c, u)
+            print(f"{fam:28s} {hname:3s} {len(cv):5d} {len(uv):6d}  {statistics.fmean(cv) * 1e4:+7.0f} {statistics.fmean(uv) * 1e4:+7.0f} {diff * 1e4:+7.0f}  t={t:+.2f}  {'yes' if agree else 'no '}  {'CROWDING EFFECT' if met else 'no effect shown'}  paired t={'n/a' if pt is None else f'{pt:+.2f}'} (n={pn})")
     print(f"\ntotal {time.time() - t0:.0f}s")
 
 

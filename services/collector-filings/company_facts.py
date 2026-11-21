@@ -208,6 +208,9 @@ async def run_forever(headers: Dict[str, str]) -> None:
     from shared.db import get_timescale
 
     await asyncio.sleep(FIRST_PASS_DELAY_SEC)
+    from shared.utils.retry_sleep import next_delay
+
+    failures = 0
     while True:
         started = datetime.now(timezone.utc)
         try:
@@ -218,8 +221,12 @@ async def run_forever(headers: Dict[str, str]) -> None:
                 stats = await sync(session, headers, await get_timescale())
             logger.info("SEC company facts pass (%s): %s", started.strftime("%H:%M"), stats)
         except Exception as e:
+            failures += 1
             swallowed("collector_filings.company_facts", e, logger)
-        await asyncio.sleep(PASS_INTERVAL_SEC)
+        else:
+            failures = 0
+        # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, PASS_INTERVAL_SEC))
 
 
 __all__ = ["extract", "registry_pairs", "run_forever", "sync"]

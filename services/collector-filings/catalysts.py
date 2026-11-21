@@ -18,13 +18,15 @@ import logging
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models import NormalizedEvent, EventType, Entity, EntityType, FinancialData, RawEvent
 from shared.models.events import RegulatoryData
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils import score_resolution
 from shared.utils.quote_cache import quote_key
 
 logger = logging.getLogger("collector.catalysts")
@@ -93,6 +95,14 @@ def short_spike_event(symbol: str, day: str, ratio: float, history: List[float],
     base = mean(history)
     jump = ratio - base
     score = round(min(0.95, 0.55 + jump * 1.5), 3)
+    # Stored beside the score so a less saturated score can be replayed and tested on the events already recorded: 21% of 442 events sat on the
+    # 0.95 cap (13 Nov 2026). The score itself is unchanged until that replay is run.
+    # The same spread the gate used to decide this fired (population sd, floored at SHORT_MIN_SD), so a replay of the stored z agrees with
+    # what fired; an unfloored sd on a flat history gave a z the gate never saw.
+    spread = max(SHORT_MIN_SD, pstdev(history)) if len(history) > 1 else 0.0
+    z_tag = f"short_vol_z:{(jump / spread):.2f}" if spread > 0 else "short_vol_z:na"
+    if score_resolution.v2_enabled():
+        score = score_resolution.short_volume_score(score, score_resolution.short_volume_z(ratio, history))
     occurred = datetime.strptime(day, "%Y%m%d").replace(hour=22, tzinfo=timezone.utc)
     return NormalizedEvent(
         event_id=f"shortvol_{symbol}_{day}_{uuid.uuid4().hex[:6]}",
@@ -113,7 +123,7 @@ def short_spike_event(symbol: str, day: str, ratio: float, history: List[float],
         # model's volume is whole shares, and a float failed validation, so
         # no spike event could be built.
         financial_data=FinancialData(ticker=symbol, volume=int(round(total)), trade_type="SHORT_VOLUME"),
-        tags=["short_volume_spike", "tradfi", f"exposes:{symbol}"],
+        tags=["short_volume_spike", "tradfi", f"exposes:{symbol}", z_tag, f"short_vol_jump:{jump:.4f}"],
         region="US",
     )
 
@@ -325,6 +335,7 @@ async def poll_fda(session, producer, redis_client, resolver) -> int:
         if not ticker:
             dropped("collector_filings.fda_unlisted_sponsor", "sponsor has no listed ticker",
                     logger, detail=approval["sponsor"][:60])
+            _collector_metrics("collector-filings").rejected("fda_unlisted_sponsor")
             continue
         await _publish(producer, approval_event(approval, ticker))
         emitted += 1

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 import aiohttp
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from services.api_gateway.dependencies import get_db, get_redis_optional
@@ -182,6 +182,7 @@ async def read_thesis(
 @router.post("/{ticker}/thesis", response_model=ThesisState)
 async def start_thesis(
     ticker: str,
+    request: Request,
     user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
     db=Depends(get_db),
     redis=Depends(get_redis_optional),
@@ -197,7 +198,7 @@ async def start_thesis(
     if have and have.get("status") in ("ready", "pending"):
         return have
 
-    who = str(user.get("email") or user.get("sub") or user.get("id") or "anonymous")
+    who = str(getattr(request.state, "identity", None) or "anonymous")
     rate_key = RATE_KEY.format(user=who)
     if int(await raw.get(rate_key) or 0) >= th.RATE_PER_HOUR:
         return _state(t, "limited", message=f"You have asked for {th.RATE_PER_HOUR} of these in the last hour. Try again later.")

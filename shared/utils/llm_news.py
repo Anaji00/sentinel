@@ -33,7 +33,25 @@ FEATURE = "llm_news_30"
 WINDOW_DAYS = 30
 MIN_HEADLINES = 2            # a stock's mean over fewer is too noisy to publish
 BATCH = 20
+TOKENS_PER_REQUEST = 1500       # a 20-headline request: about 1,470 measured, with the model's reasoning counted against the same quota
+
+
+def pace_seconds(tpm_limit: int, tokens_per_request: int = TOKENS_PER_REQUEST, use_share: float = 0.8) -> float:
+    """Seconds to leave between requests so they spend at most `use_share` of a tokens-a-minute limit; 0 when the model has no such limit.
+    Requests were sent back to back and the third in a minute met a full 8,000-token bucket (38 refusals in a day, 13 Nov 2026)."""
+    if not tpm_limit or tpm_limit <= 0 or use_share <= 0:
+        return 0.0
+    return round(60.0 * tokens_per_request / (tpm_limit * use_share), 2)
 MAX_HEADLINE_CHARS = 240
+MAX_WAIT_SECONDS = 30 * 60      # a partial batch waits this long for more headlines before it is sent
+
+
+def ready_to_send(n_rows: int, oldest_age_seconds: float, batch: int = BATCH, max_wait: float = MAX_WAIT_SECONDS) -> bool:
+    """A request is worth its fixed prompt cost when it carries a full batch, or when its oldest headline has waited `max_wait`. Overnight the job sent one
+    headline per request ("scored 1, requests 1" repeated); the scores are the same, the calls fewer. Nothing waiting is never ready."""
+    if n_rows <= 0:
+        return False
+    return n_rows >= batch or oldest_age_seconds >= max_wait
 
 EVENT_TYPES = ("earnings", "guidance", "merger", "regulatory", "litigation", "management", "contract", "offering",
                "analyst", "product", "other")

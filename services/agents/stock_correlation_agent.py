@@ -619,6 +619,9 @@ class StockCorrelationAgent(SentinelAgent):
         """
         Main reasoning loop for incoming events and tick updates.
         """
+        # The correlation this message is about, so every prediction recorded below names its source (services/agents/prediction_scoring.CURRENT_CORRELATION_ID).
+        from services.agents.prediction_scoring import CURRENT_CORRELATION_ID
+        CURRENT_CORRELATION_ID.set(str((message or {}).get("correlation_id") or "") or None)
         # Admission is checked before the context is built, not after.
         #
         # The wargamer, the knowledge graph and the reasoning service already

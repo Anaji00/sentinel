@@ -22,12 +22,16 @@ import {
   ORDER,
   plainIdea,
   plainOption,
+  forecastIsPlateau,
+  sharedForecastKeys,
   type Idea,
   type Recommendations,
 } from '../lib/ideas';
 import { POLL } from './ui/DataProvider';
 import { IconCheck } from './ui/icons';
 import { IdeaCard } from './IdeaCard';
+import { IdeaRow } from './IdeaRow';
+import { Button } from './ui/Button';
 
 export { ideaDetails, plainIdea, plainOption };
 
@@ -85,6 +89,8 @@ export function TradeIdeas() {
   const available = ORDER.filter((h) => data?.horizons?.[h]);
   const [tab, setTab] = useState<string | null>(null);
   const [showAllEvents, setShowAllEvents] = useState(false);
+  // The list reads fastest; the cards carry the options trade and the record of past ideas.
+  const [view, setView] = useState<'list' | 'cards'>('list');
   const active =
     tab && data?.horizons?.[tab]
       ? tab
@@ -93,6 +99,8 @@ export function TradeIdeas() {
         : available[0];
   const h = active ? data?.horizons?.[active] : undefined;
   const label = (k: string) => LABEL[k]?.split(' (')[0] ?? k;
+  // An expected move shared exactly by three or more ideas in this holding period is a plateau, not a forecast.
+  const shared = sharedForecastKeys(h?.ideas);
   const columns: Column[] = h
     ? [
         {
@@ -190,6 +198,14 @@ export function TradeIdeas() {
           {h.withheld && (
             <p className="text-xs text-ink-mute">No calls for this holding period. {h.withheld}.</p>
           )}
+          <div role="group" aria-label="Layout" className="flex gap-1.5">
+            <Button variant="outline" size="sm" pressed={view === 'list'} onClick={() => setView('list')}>
+              List
+            </Button>
+            <Button variant="outline" size="sm" pressed={view === 'cards'} onClick={() => setView('cards')}>
+              Cards, with the options trade
+            </Button>
+          </div>
           <div className="grid gap-5 @4xl:grid-cols-2">
             {columns.map((c) => (
               <div key={c.title} className="space-y-3">
@@ -203,10 +219,17 @@ export function TradeIdeas() {
                   <p className="rounded-md border border-dashed border-line p-4 text-xs text-ink-mute">
                     None for this holding period.
                   </p>
+                ) : view === 'list' ? (
+                  <ul>
+                    {c.ideas.map((i) => (
+                      <IdeaRow key={`${i.ticker}-${i.direction}`} idea={i} days={h.horizon_days} plateau={forecastIsPlateau(i, shared)} fallbackBps={h.expected_excess_bps} />
+                    ))}
+                  </ul>
                 ) : (
                   <div className="grid gap-3 @md:grid-cols-2">
                     {c.ideas.map((i) => (
                       <IdeaCard
+                        plateau={forecastIsPlateau(i, shared)}
                         key={`${i.ticker}-${i.direction}`}
                         idea={i}
                         days={h.horizon_days}

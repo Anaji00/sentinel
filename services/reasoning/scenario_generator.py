@@ -47,7 +47,8 @@ import aiohttp
 from pydantic import BaseModel, Field, field_validator
 from shared.utils.untrusted_text import quote_untrusted_block
 from shared.utils import fact_check
-from shared.utils.quiet_failures import dropped
+from shared.utils import llm_output_checks
+from shared.utils.quiet_failures import dropped, noted
 from shared.models.events import ResolutionSignal
 
 from shared.models import CorrelationCluster, Scenario, ScenarioStatus
@@ -1299,6 +1300,19 @@ Review the intelligence scenario draft, challenge weak assumptions, refine confi
                 scenario.confidence_rationale = f"{scenario.confidence_rationale or ''} [Fact check: {fc.summary()}]".strip()
                 dropped("reasoning.scenario_unsupported_numbers", "scenario numbers not in its data; confidence capped",
                         logger, detail=fc.summary())
+
+        # Deterministic self-consistency checks that cost no inference (shared/utils/llm_output_checks.py): counted, never a reject or a gate.
+        flags = llm_output_checks.check_scenario(
+            f"{output.headline} {output.confidence_rationale} {_scenario_body_text(output)}",
+            getattr(output, "confidence_overall", None), [getattr(h, "probability", None) for h in output.hypotheses])
+        if flags["confidence_mismatch"]:
+            noted("reasoning.scenario_confidence_mismatch", "the narrative states a different overall confidence than the stored field", logger,
+                  detail=f"text {flags['confidence_mismatch'][0]}, field {flags['confidence_mismatch'][1]}")
+        if flags["round_triple"]:
+            noted("reasoning.scenario_round_probabilities", "hypothesis probabilities are a round template", logger,
+                  variant=flags["round_triple"])
+        if flags["artifact"]:
+            noted("reasoning.scenario_calls_itself_artifact", "the scenario judges its own correlation an artifact or noise", logger)
 
         logger.info(
             "✅ Scenario synthesized: %s (confidence=%d%%)",

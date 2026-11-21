@@ -41,7 +41,8 @@ function Lines({ a, b, aTicker, bTicker }: { a: number[]; b: number[]; aTicker: 
   const lo = Math.min(...all);
   const hi = Math.max(...all);
   const span = hi - lo || 1;
-  const x = (i: number) => PAD + (i / Math.max(1, a.length - 1)) * (W - 2 * PAD);
+  // Room on the right for each line's name and final change, so the colours are not the only way to tell them apart.
+  const x = (i: number) => PAD + (i / Math.max(1, a.length - 1)) * (W - 2 * PAD - 84);
   const y = (v: number) => H - PAD - ((v - lo) / span) * (H - 2 * PAD);
   const path = (s: number[]) => s.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' ');
   return (
@@ -49,6 +50,21 @@ function Lines({ a, b, aTicker, bTicker }: { a: number[]; b: number[]; aTicker: 
       <line x1={PAD} x2={W - PAD} y1={y(0)} y2={y(0)} className="stroke-line-strong" strokeDasharray="3 3" />
       <path d={path(b)} fill="none" className="stroke-caution" strokeWidth={1.5} />
       <path d={path(a)} fill="none" className="stroke-accent" strokeWidth={1.5} />
+      {[
+        { t: aTicker, v: a[a.length - 1], cls: 'fill-accent' },
+        { t: bTicker, v: b[b.length - 1], cls: 'fill-caution' },
+      ]
+        .map((l, i, arr) => {
+          const ly = y(l.v);
+          const other = y(arr[1 - i].v);
+          // Two labels close together are pushed apart so both stay readable.
+          const nudge = Math.abs(ly - other) < 12 ? (ly <= other ? -6 : 6) : 0;
+          return (
+            <text key={l.t} x={x(a.length - 1) + 6} y={ly + 3 + nudge} fontSize={10} className={l.cls}>
+              {l.t} {pct(l.v)}
+            </text>
+          );
+        })}
     </svg>
   );
 }

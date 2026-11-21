@@ -53,9 +53,11 @@ from check_constructor_arity import scan  # noqa: E402
 # subscribed through the stream URL, so neither sends a post-connect frame.
 # Moved by four on 4 November, when the venue-refusal constants went in above
 # them. Re-read: the same two streams, still subscribed through the URL.
+# Moved by two on 19 Nov 2026, when the reject counters went into the funding-rate parser above the second stream. Re-read: still the
+# funding-rate stream, subscribed through its URL, no post-connect frame.
 ALLOWED = {
     ("services", "collector-crypto", "main.py", 232),
-    ("services", "collector-crypto", "main.py", 367),
+    ("services", "collector-crypto", "main.py", 369),
 }
 
 

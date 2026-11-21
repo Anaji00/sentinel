@@ -1,0 +1,178 @@
+{
+ "offsets": [
+  0,
+  5,
+  10,
+  15,
+  2,
+  7,
+  12,
+  17
+ ],
+ "c3": {
+  "feature_list_size": 29,
+  "features": {
+   "llm_news_30": {
+    "model_input": false,
+    "stored": {
+     "rows": 44392,
+     "tickers": 4906,
+     "first_day": "2026-10-29",
+     "last_day": "2026-11-14",
+     "days": 16
+    },
+    "result": "no-op: not a column of the monthly model, so the ablated model is the full model (difference exactly 0 on every calendar)",
+    "diffs": {
+     "0": 0.0,
+     "5": 0.0,
+     "10": 0.0,
+     "15": 0.0,
+     "2": 0.0,
+     "7": 0.0,
+     "12": 0.0,
+     "17": 0.0
+    },
+    "verdict": {
+     "calendars": 8,
+     "costly": 0,
+     "need": 6,
+     "keep_calls": false,
+     "mean_diff": 0.0
+    }
+   },
+   "ev_comment_letter": {
+    "model_input": false,
+    "stored": {
+     "rows": 660,
+     "tickers": 397,
+     "first_day": "2023-11-06",
+     "last_day": "2026-06-11",
+     "days": 372
+    },
+    "result": "no-op: not a column of the monthly model, so the ablated model is the full model (difference exactly 0 on every calendar)",
+    "diffs": {
+     "0": 0.0,
+     "5": 0.0,
+     "10": 0.0,
+     "15": 0.0,
+     "2": 0.0,
+     "7": 0.0,
+     "12": 0.0,
+     "17": 0.0
+    },
+    "verdict": {
+     "calendars": 8,
+     "costly": 0,
+     "need": 6,
+     "keep_calls": false,
+     "mean_diff": 0.0
+    }
+   }
+  }
+ },
+ "b1": {
+  "regexes": {
+   "raise": "\\b(?:raises|lifts|boosts)\\b.*\\bprice\\s+target",
+   "lower": "\\b(?:lowers|cuts)\\b.*\\bprice\\s+target",
+   "upgrade": "\\bupgrades\\b",
+   "downgrade": "\\bdowngrades\\b",
+   "flags": "IGNORECASE"
+  },
+  "stored": {
+   "scored": 30455,
+   "stale_recorded": 4917,
+   "first": "2026-10-28 14:59:21+00:00",
+   "last": "2026-11-14 04:00:29+00:00"
+  },
+  "a_non_matching": {
+   "headlines": 27067,
+   "identical": true
+  },
+  "agreement": {
+   "raise_pt": {
+    "n": 1595,
+    "agree": 0.9404388714733543,
+    "zero": 0.035736677115987464,
+    "opposite": 0.023824451410658306
+   },
+   "lower_pt": {
+    "n": 1378,
+    "agree": 0.9238026124818578,
+    "zero": 0.06313497822931785,
+    "opposite": 0.013062409288824383
+   },
+   "upgrade": {
+    "n": 178,
+    "agree": 0.8820224719101124,
+    "zero": 0.07865168539325842,
+    "opposite": 0.03932584269662921
+   },
+   "downgrade": {
+    "n": 237,
+    "agree": 0.9789029535864979,
+    "zero": 0.02109704641350211,
+    "opposite": 0.0
+   }
+  },
+  "matched_among_scored": {
+   "matched": 3388,
+   "scored": 30455,
+   "share": 0.1112461008044656,
+   "old_score_zero": 0.048110979929161746
+  },
+  "feature_versions": {
+   "days": 18,
+   "stock_days": 52619,
+   "changed": 2087,
+   "mean_rank_corr": 0.9926397156648955
+  },
+  "rebuild_vs_stored_last_day": {
+   "day": "2026-11-14",
+   "stored_names": 4906,
+   "rebuilt_names": 4906,
+   "equal": 4883
+  },
+  "admission": {
+   "large_caps": 2327,
+   "single_stock_headlines": 25551,
+   "stale_skipped": 6822,
+   "would_score": 18729,
+   "window": {
+    "matched": 1773,
+    "would_score": 18729,
+    "share": 0.09466602594906295
+   },
+   "last_7_days": {
+    "matched": 445,
+    "would_score": 5444,
+    "share": 0.08174136664217486
+   }
+  },
+  "walk_forward": {
+   "feature_is_model_input": false,
+   "feature_days_of_history": 18,
+   "needed_sessions": 260,
+   "measurable": false,
+   "diffs": {
+    "0": 0.0,
+    "5": 0.0,
+    "10": 0.0,
+    "15": 0.0,
+    "2": 0.0,
+    "7": 0.0,
+    "12": 0.0,
+    "17": 0.0
+   }
+  },
+  "verdict": {
+   "calendars": 8,
+   "not_worse": 8,
+   "need": 6,
+   "sharpe_ok": true,
+   "call_cut": 0.09466602594906295,
+   "cut_ok": false,
+   "adopt": false,
+   "sharpe_condition_is_vacuous": true
+  }
+ }
+}

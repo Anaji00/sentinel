@@ -1,5 +1,5 @@
 import logging 
-from datetime import datetime
+from datetime import datetime, timezone
 from shared.models import NormalizedEvent
 from shared.utils.event_identity import as_uuid
 
@@ -53,7 +53,7 @@ class DBWriter:
             event_id,
             e.type.value if hasattr(e.type, 'value') else e.type,
             e.occurred_at,
-            getattr(e, 'collected_at', datetime.now()),
+            getattr(e, 'collected_at', datetime.now(timezone.utc)),
             e.source,
             getattr(e, 'source_reliability', 1.0),
             pe_id,

@@ -7,6 +7,7 @@ Uses MarkdownV2 formatting.
 
 import re
 from shared.models import CorrelationCluster, Scenario
+from shared.utils.alert_wording import direction_note
 
 
 def _escape(text: str) -> str:
@@ -39,6 +40,7 @@ def format_correlation(cluster: CorrelationCluster) -> str:
         "",
         _escape(cluster.description),
         "",
+        *([_escape(direction_note(cluster.rule_name)), ""] if direction_note(cluster.rule_name) else []),
         f"Tags: `{_escape_code(', '.join(cluster.tags[:6]))}`",
         f"Time: {_escape(cluster.detected_at.strftime('%Y-%m-%d %H:%M UTC'))}",
         f"ID: `{_escape_code(cluster.correlation_id[:8])}`",

@@ -269,8 +269,12 @@ async def run_vessel_feeds(producer, redis_client) -> None:
         )
     if not (gfw_on or viirs_on):
         return
+    from shared.utils.retry_sleep import next_delay
+
+    failures = 0
     async with aiohttp.ClientSession() as session:
         while True:
+            failed = False
             if gfw_on:
                 try:
                     n = await poll_gfw(session, producer, redis_client)
@@ -278,6 +282,7 @@ async def run_vessel_feeds(producer, redis_client) -> None:
                 except PermissionError as exc:
                     logger.error("Global Fishing Watch: %s; check GFW_API_TOKEN", exc)
                 except Exception as exc:
+                    failed = True
                     swallowed("collector.sar.feeds.gfw", exc, logger)
             if viirs_on:
                 try:
@@ -286,8 +291,11 @@ async def run_vessel_feeds(producer, redis_client) -> None:
                 except PermissionError as exc:
                     logger.error("VIIRS boat detection: %s; check the EOG_ settings", exc)
                 except Exception as exc:
+                    failed = True
                     swallowed("collector.sar.feeds.viirs", exc, logger)
-            await asyncio.sleep(FEED_INTERVAL_SEC)
+            failures = failures + 1 if failed else 0
+            # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+            await asyncio.sleep(next_delay(failures, FEED_INTERVAL_SEC))
 
 
 __all__ = ["poll_gfw", "poll_viirs", "run_vessel_feeds"]

@@ -50,7 +50,7 @@ from shared.utils.heartbeat import start_heartbeat_task, touch_heartbeat
 
 
 from shared.utils.logging import setup_sentinel_logging
-from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 
@@ -229,8 +229,11 @@ async def collect(producer: SentinelProducer, counter: MessageCounter):
     # path referring to a name this scope never defined, and the NameError was
     # caught by the broad `except Exception` a few lines below -- so messages
     # still reached Kafka while every one of them took the failure path and no
-    # ingest metric was ever recorded.
-    metrics = CollectorMetrics("collector-ais")
+    # ingest metric was ever recorded. for_service() hands main() the same
+    # instance: two separate objects left the starvation watcher in main()
+    # seeing zero arrivals forever, so collector_starved stayed 1 while 9,230
+    # messages a week flowed.
+    metrics = _collector_metrics("collector-ais")
 
     while True:
         try:
@@ -326,7 +329,7 @@ async def main():
         redis = await get_redis()
         # Throughput counters. The heartbeat proves this process is alive;
         # these prove it is still producing.
-        metrics = CollectorMetrics("collector-ais")
+        metrics = _collector_metrics("collector-ais")
         await metrics.start(redis)
         # AISStream accepts an inactive API key without ever returning an error:
         # the socket opens, the subscription is acknowledged, and no message ever

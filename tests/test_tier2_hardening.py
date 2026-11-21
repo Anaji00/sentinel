@@ -359,7 +359,10 @@ def test_deployment_profiles_fit_the_memory_budget():
     # 5.74 GiB mid-run while the whole stack used 18.9 GiB of the 26 GiB VM.
     # Raised by 2 on 11 Nov 2026 for agents-heavy 1G -> 3G, by decision: with the study reading ten years of history it ran
     # at 817 MiB of its 1G and was restarted three times by 02:00 UTC on 7 Nov; the 3G is a ceiling for that one read.
-    assert ceiling({"agents"}) < WSL_BUDGET_GIB + 8.0, "reasoning mode must stay within a bounded overcommit"
+    # Raised by 1 on 13 Nov 2026 for correlation 2G -> 2.5G and qdrant 1G -> 1.5G, by decision: correlation sat at 1.83G of 2G (92%) and qdrant
+    # at 83% of 1G, near the cap that restarts them. Measured that day the whole stack used about 14 GiB of the 25.4 GiB VM, so these are ceilings
+    # for one peak each, not use.
+    assert ceiling({"agents"}) < WSL_BUDGET_GIB + 9.0, "reasoning mode must stay within a bounded overcommit"
 
     # Collectors and agents together previously exceeded the budget, and this
     # asserted the incompatibility to keep it deliberate. Ceilings were then
@@ -368,11 +371,11 @@ def test_deployment_profiles_fit_the_memory_budget():
     # The full stack (collectors and agents, which is how it runs) used 17.7 GiB
     # on 28 Oct 2026 against limits that now sum past the VM; the same bounded
     # overcommit as above, sized to the full stack's limits (raised by 2 on 11 Nov 2026 with agents-heavy, see above).
-    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB + 11.0, (
+    assert ceiling({"collectors", "agents"}) < WSL_BUDGET_GIB + 12.0, (      # +1 on 13 Nov 2026, as above
         "collectors and agents must co-exist"
     )
     # Observability adds its own ceilings on top (not running on 28 Oct 2026).
-    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB + 12.0, (      # +2 on 11 Nov 2026, as above
+    assert ceiling({"collectors", "agents", "obs"}) < WSL_BUDGET_GIB + 13.0, (      # +2 on 11 Nov 2026 and +1 on 13 Nov 2026, as above
         "the full stack including observability must fit"
     )
 

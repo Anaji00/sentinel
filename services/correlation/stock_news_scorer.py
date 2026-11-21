@@ -29,6 +29,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 from shared.db import get_redis, get_timescale
 from shared.utils import news_embed as ne
 from shared.utils import news_embed_fit as nf
+from shared.utils import score_resolution
 from shared.utils import stock_news as sn
 from shared.utils.quiet_failures import swallowed
 
@@ -66,6 +67,14 @@ _ARCHIVE_SQL = """
                                       sentiment, primary_entity_id, financial_data, region)
     VALUES ($1, 'headline', $2, $3, $3, $4, NULL, $5, $6, $7, $8::jsonb, NULL)
     ON CONFLICT DO NOTHING
+"""
+
+
+# Articles naming the stock in the 6 hours up to this one (itself included), and in the 20 days before that window.
+_COUNTS_SQL = """
+    SELECT count(*) FILTER (WHERE created_at > $2::timestamptz - INTERVAL '6 hours' AND created_at <= $2::timestamptz) AS n6,
+           count(*) FILTER (WHERE created_at <= $2::timestamptz - INTERVAL '6 hours') AS n20
+    FROM stock_news WHERE symbols @> ARRAY[$1]::text[] AND created_at > $2::timestamptz - INTERVAL '20 days 6 hours' AND created_at <= $2::timestamptz
 """
 
 
@@ -123,8 +132,19 @@ class StockNewsScorer:
             fd = {"ticker": ev["symbols"][0], "symbols": ev["symbols"], "tone": ev["tone"], "news_id": int(r["id"])}
             eid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"alpaca-news:{r['id']}"))
             if at >= event_cut:
+                score = sn.EVENT_ANOMALY_SCORE
+                # The 6-hour and 20-day article counts are stored on each new event so the score can be replayed
+                # (reports/Grading and score replays - 13 Nov.md); the score changes only under SCORE_RESOLUTION_V2.
+                try:
+                    cnt = await db.query_one(_COUNTS_SQL, ev["symbols"][0], at)
+                    if cnt:
+                        fd["news_n_6h"], fd["news_n_20d"] = int(cnt["n6"]), int(cnt["n20"])
+                        if score_resolution.v2_enabled():
+                            score = score_resolution.news_score(score_resolution.news_z(fd["news_n_6h"], fd["news_n_20d"]))
+                except Exception as e:
+                    swallowed("correlation.stock_news_scorer.counts", e, logger)
                 live.append((eid, sn.EVENT_SOURCE, at, datetime.now(timezone.utc), str(r["headline"]), ev["tags"],
-                             ev["tone"], ev["symbols"][0], fd, sn.EVENT_ANOMALY_SCORE))
+                             ev["tone"], ev["symbols"][0], fd, score))
             else:
                 history.append((eid, sn.EVENT_SOURCE, at, str(r["headline"]), ev["tags"], ev["tone"], ev["symbols"][0],
                                 fd))

@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from shared.utils import forecast_skill as fs
@@ -231,6 +231,12 @@ class Grader:
             except Exception as exc:
                 logger.error("Producer grading failed: %s", exc, exc_info=True)
             try:
+                from services.agents.excess_grading import grade_beta_pending, grade_pending
+                out["excess_graded"] = (await grade_pending(self.db)).get("graded", 0)
+                out["beta_graded"] = (await grade_beta_pending(self.db)).get("graded", 0)
+            except Exception as exc:
+                logger.error("Excess-return grading failed: %s", exc, exc_info=True)
+            try:
                 models = await self.anomaly_calibration()
                 await self.raw.set(scal.ANOMALY_CALIBRATION_KEY, json.dumps(models, default=str))
                 out["calibrated_producers"] = len(models.get("producers", {}))
@@ -254,7 +260,7 @@ class Grader:
         for r in await self.db.query(_CALIBRATION_SQL) or []:
             samples[scal.producer_key(str(r["type"]), str(r["source"]))].append((float(r["s"]), float(r["ratio"])))
         producers = {k: m for k, v in samples.items() if (m := scal.fit(v)) is not None}
-        return {"generated_at": datetime.utcnow().isoformat(), "window_days": CALIBRATION_WINDOW_DAYS,
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "window_days": CALIBRATION_WINDOW_DAYS,
                 "big_move": scal.BIG_MOVE, "producers": producers}
 
     async def producers(self) -> Dict[str, Any]:

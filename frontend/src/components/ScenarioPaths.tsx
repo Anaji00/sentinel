@@ -30,7 +30,7 @@ function Path({ h }: { h: ScenarioHypothesis }) {
     <li className="space-y-1.5 rounded-sm border border-line bg-page p-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-xs font-semibold text-ink">{h.label ?? 'Possible outcome'}</span>
-        {p !== null && <span className="shrink-0 font-mono text-micro text-ink-dim">{formatNumber(p, { decimals: 0 })}% likely</span>}
+        {p !== null && <span className="shrink-0 font-mono text-micro text-ink-dim">{formatNumber(p, { decimals: 0 })}% weight</span>}
       </div>
       {p !== null && (
         <div className="h-1 rounded-sm bg-line" role="presentation">
@@ -52,6 +52,7 @@ export default function ScenarioPaths({ scenario }: { scenario: Scenario }) {
   return (
     <section aria-label="How this could play out" className="space-y-2">
       <span className="block font-bold text-accent">How this could play out</span>
+      <p className="text-micro text-ink-mute">The weights are the model&apos;s own estimate. They have not been checked against what happened, so they are not odds.</p>
       {paths.length > 0 && (
         <ul className="space-y-2">
           {paths.map((h, i) => (

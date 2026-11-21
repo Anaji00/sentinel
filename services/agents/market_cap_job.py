@@ -31,6 +31,9 @@ vs AS (SELECT DISTINCT ON (ticker) ticker, shares FROM vendor_shares WHERE as_of
 SELECT px.ticker, coalesce(sh.shares, vs.shares) * px.close AS cap
 FROM px LEFT JOIN sh USING (ticker) LEFT JOIN vs USING (ticker)
 """
+_ADV_SQL = """
+SELECT ticker, avg(close * volume) AS adv FROM daily_bars WHERE day > now() - interval '30 days' AND volume > 0 GROUP BY ticker
+"""
 
 
 class MarketCapJob:
@@ -56,7 +59,8 @@ class MarketCapJob:
             chunk = tickers[i:i + 500]
             for t, v in zip(chunk, await self.raw.mget([mc.market_cap_key(t) for t in chunk])):
                 cached[t] = mc.parse_market_cap(v)
-        best = mc.cap_rows(computed, cached, tickers)
+        adv = {str(r["ticker"]).upper(): float(r["adv"]) for r in await self.db.query(_ADV_SQL) or [] if r["adv"]}
+        best = mc.cap_rows(computed, cached, tickers, adv)
         if not best:
             return {"tickers": len(tickers), "with_cap": 0}
         tmp = mc.CAPS_KEY + ":building"

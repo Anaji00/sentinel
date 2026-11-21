@@ -2713,6 +2713,234 @@ MIGRATIONS = [
             ALTER TABLE auto_trade_orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;
         """,
         "transactional": True
+    },
+    {
+        "version": "0089_price_alerts",
+        "sql": """
+            -- A viewer's price alerts (in-app and browser). Evaluated on read from stored minute bars since checked_at;
+            -- seen_at is when the viewer acknowledged the notification.
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id               BIGSERIAL PRIMARY KEY,
+                owner            TEXT NOT NULL,
+                ticker           TEXT NOT NULL,
+                direction        TEXT NOT NULL CHECK (direction IN ('above', 'below')),
+                level            DOUBLE PRECISION NOT NULL CHECK (level > 0),
+                note             TEXT,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                checked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                triggered_at     TIMESTAMPTZ,
+                triggered_price  DOUBLE PRECISION,
+                seen_at          TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS price_alerts_owner ON price_alerts (owner, created_at DESC);
+            CREATE INDEX IF NOT EXISTS price_alerts_active ON price_alerts (owner) WHERE triggered_at IS NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0090_autovacuum_and_unused_index",
+        "sql": """
+            -- Tables that are rewritten in bulk each day (daily-bar upserts, feature and rate refreshes) gather dead rows faster than the
+            -- default 20% threshold clears them: daily_bars held 5M dead tuples against 20M live (13 Nov 2026). Vacuum and analyse at 2%.
+            ALTER TABLE daily_bars SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+            ALTER TABLE stock_features_daily SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+            ALTER TABLE borrow_rates SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.05);
+            ALTER TABLE fundamentals SET (autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_scale_factor = 0.05);
+            -- 606 MB, never scanned (idx_scan 0); nothing in the code reads fails_to_deliver by ticker, only inserts into it.
+            DROP INDEX IF EXISTS idx_fails_ticker;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0091_pg_stat_statements",
+        "sql": """
+            -- Query timing (13 Nov 2026): the library is preloaded in docker-compose.yml; this creates the view in a fresh database.
+            CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0092_cftc_cot_treasury_auctions",
+        "sql": """
+            -- Free datasets collected at release for measurement only (13 Nov 2026); nothing reads these into an alert. report_date is the
+            -- positions' as-of Tuesday, published_at the release time (scheduled; published_basis says how it was set), fetched_at when we stored it.
+            CREATE TABLE IF NOT EXISTS cftc_cot (
+                report_date     DATE NOT NULL,
+                contract_code   TEXT NOT NULL,
+                market_name     TEXT,
+                exchange_code   TEXT,
+                commodity_name  TEXT,
+                open_interest   BIGINT,
+                prod_long       BIGINT, prod_short   BIGINT,
+                swap_long       BIGINT, swap_short   BIGINT, swap_spread BIGINT,
+                mm_long         BIGINT, mm_short     BIGINT, mm_spread   BIGINT,
+                other_long      BIGINT, other_short  BIGINT,
+                nonrept_long    BIGINT, nonrept_short BIGINT,
+                chg_mm_long     BIGINT, chg_mm_short BIGINT,
+                published_at    TIMESTAMPTZ NOT NULL,
+                published_basis TEXT NOT NULL,
+                fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (contract_code, report_date)
+            );
+            CREATE INDEX IF NOT EXISTS cftc_cot_published ON cftc_cot (published_at DESC);
+            CREATE TABLE IF NOT EXISTS treasury_auctions (
+                cusip            TEXT NOT NULL,
+                auction_date     DATE NOT NULL,
+                security_type    TEXT NOT NULL,
+                security_term    TEXT NOT NULL,
+                issue_date       DATE,
+                close_time       TEXT,
+                bid_to_cover     DOUBLE PRECISION,
+                high_yield       DOUBLE PRECISION,
+                median_yield     DOUBLE PRECISION,
+                offering_amount  DOUBLE PRECISION,
+                indirect_awarded DOUBLE PRECISION, direct_awarded DOUBLE PRECISION, dealer_awarded DOUBLE PRECISION,
+                indirect_share   DOUBLE PRECISION, direct_share   DOUBLE PRECISION, dealer_share   DOUBLE PRECISION,
+                reopening        BOOLEAN,
+                cash_management  BOOLEAN,
+                published_at     TIMESTAMPTZ NOT NULL,
+                published_basis  TEXT NOT NULL,
+                fetched_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (cusip, auction_date)
+            );
+            CREATE INDEX IF NOT EXISTS treasury_auctions_day ON treasury_auctions (auction_date DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0093_reg_sho_threshold",
+        "sql": """
+            -- Reg SHO threshold list, one row per symbol per list date, as Nasdaq publishes it (13 Nov 2026). Measurement only.
+            CREATE TABLE IF NOT EXISTS reg_sho_threshold (
+                list_date       DATE NOT NULL,
+                symbol          TEXT NOT NULL,
+                security_name   TEXT,
+                market_category TEXT,
+                exchange        TEXT NOT NULL,
+                published_at    TIMESTAMPTZ,
+                fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (list_date, symbol, exchange)
+            );
+            CREATE INDEX IF NOT EXISTS reg_sho_threshold_symbol ON reg_sho_threshold (symbol, list_date DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0094_agent_prediction_excess_return",
+        "sql": """
+            -- Market-neutral grading (registered 13 Nov 2026, report only): the stock's return over the call's window beside the
+            -- return of SPY and of its sector ETF, and the excess of each. outcome_correct, direction and brier_score are untouched.
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS stock_return     DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS spy_return       DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS sector_etf       TEXT;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS sector_return    DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_spy       DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_sector    DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_graded_at TIMESTAMPTZ;
+            -- Attempts that found no bars; a row is parked at the limit so one bad ticker cannot be retried forever.
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_attempts  INT NOT NULL DEFAULT 0;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0095_agent_prediction_excess_pending_index",
+        "sql": """
+            -- The backfill and the daily pass read only resolved rows still waiting for an excess return.
+            CREATE INDEX IF NOT EXISTS agent_pred_excess_pending ON agent_predictions (occurred_at)
+                WHERE resolved_at IS NOT NULL AND excess_graded_at IS NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0096_correlations_entity_index",
+        "sql": """
+            -- The evidence bundle, watchlist strip and digest read a stock's recent correlations by primary_entity_id: a 2 s parallel sequential scan
+            -- for NVDA (review, 13 Nov 2026). This serves them from the index.
+            CREATE INDEX IF NOT EXISTS correlations_entity_time ON correlations (primary_entity_id, detected_at DESC);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0097_correlations_divergence_index",
+        "sql": """
+            -- The regime and feed queries read a stock's divergence alerts only; the (primary_entity_id, detected_at) index still reads every correlation of
+            -- the stock and filters the tag afterwards (2,767 rows for NVDA, 3.3 s cold). A partial index holds just the divergence rows.
+            CREATE INDEX IF NOT EXISTS correlations_divergence_entity_time ON correlations (primary_entity_id, detected_at DESC)
+                WHERE 'divergence' = ANY(tags);
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0098_book_shadow_books",
+        "sql": """
+            -- The S5 (conviction-weighted) shadow of B1, recorded at each rebalance and never traded (services/agents/book_shadow.py; registered 13 Nov 2026).
+            CREATE TABLE IF NOT EXISTS book_shadow_books (
+                rebalanced_on  DATE NOT NULL,
+                variant        TEXT NOT NULL,
+                weights        JSONB NOT NULL,
+                scores_as_of   DATE,
+                recorded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (rebalanced_on, variant)
+            );
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0099_agent_prediction_excess_beta",
+        "sql": """
+            -- Beta-adjusted grading (report only): excess_spy credits high-beta shorts in a falling market. beta_126d is the stock's beta to SPY over the
+            -- 126 sessions before the call (null under 60 returns); excess_beta = stock_return - beta_126d * spy_return. excess_spy stays for comparison.
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS beta_126d DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_beta DOUBLE PRECISION;
+            ALTER TABLE agent_predictions ADD COLUMN IF NOT EXISTS excess_beta_attempts INT NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS agent_pred_beta_pending ON agent_predictions (occurred_at)
+                WHERE excess_graded_at IS NOT NULL AND excess_beta IS NULL;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0100_agent_prediction_unique",
+        "sql": """
+            -- Review F8 (18 Nov): the resolver persisted a prediction again on every re-resolution (6 rows for one prediction, outcomes t,t,t,t,f,t). The extra rows
+            -- are copied to agent_predictions_dupes_19nov (nothing is lost), the earliest row of each prediction is kept, and a unique index with ON CONFLICT DO NOTHING in
+            -- services/agents/prediction_scoring.py stops it recurring. The telemetry worker's rows (no agent name, the literal prediction_id wargame_sim) are outside it.
+            CREATE TABLE IF NOT EXISTS agent_predictions_dupes_19nov AS SELECT * FROM agent_predictions WHERE false;
+            INSERT INTO agent_predictions_dupes_19nov
+                SELECT p.* FROM agent_predictions p
+                WHERE p.agent_name IS NOT NULL AND p.agent_name <> '' AND p.prediction_id <> 'wargame_sim'
+                  AND p.id <> (SELECT min(q.id) FROM agent_predictions q WHERE q.prediction_id = p.prediction_id AND q.agent_name = p.agent_name)
+                  AND NOT EXISTS (SELECT 1 FROM agent_predictions_dupes_19nov d WHERE d.id = p.id);
+            DELETE FROM agent_predictions p
+                WHERE p.agent_name IS NOT NULL AND p.agent_name <> '' AND p.prediction_id <> 'wargame_sim'
+                  AND p.id <> (SELECT min(q.id) FROM agent_predictions q WHERE q.prediction_id = p.prediction_id AND q.agent_name = p.agent_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS agent_pred_unique_prediction ON agent_predictions (prediction_id, agent_name)
+                WHERE agent_name IS NOT NULL AND agent_name <> '' AND prediction_id <> 'wargame_sim';
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0101_scenario_initial_state",
+        "sql": """
+            -- P6 Phase 0 (21 Nov): the generator's probabilities and confidence as first written, kept once so they can be graded against confirmed or denied
+            -- (hypotheses and confidence_overall are rewritten by the tracker). Null on scenarios created before this migration.
+            ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS initial_state JSONB;
+        """,
+        "transactional": True
+    },
+    {
+        "version": "0102_book_shadow_ledger",
+        "sql": """
+            -- Record-only nightly measures of the stored B1 book (services/agents/shadow_ledger.py): the estimated daily borrow cost at 2% a year and
+            -- the per-side veto counts. Never read by the trader.
+            CREATE TABLE IF NOT EXISTS book_shadow_ledger (
+                day          DATE NOT NULL,
+                kind         TEXT NOT NULL,
+                payload      JSONB NOT NULL,
+                recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (day, kind)
+            );
+        """,
+        "transactional": True
     }
 ]
 

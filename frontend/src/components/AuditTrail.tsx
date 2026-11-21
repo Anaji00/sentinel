@@ -97,7 +97,10 @@ const VERDICT: Record<
 };
 
 /** `EXECUTE_BUY_ORDER` -> "Execute buy order". The raw code stays on hover. */
+const ACTION_NAME: Record<string, string> = { REPLAY_DEAD_LETTERS: 'Retry failed events' };
+
 export function actionWords(code: string): string {
+  if (ACTION_NAME[code]) return ACTION_NAME[code];
   const w = code.replace(/[_.]+/g, ' ').trim().toLowerCase();
   return w.charAt(0).toUpperCase() + w.slice(1);
 }
@@ -169,7 +172,7 @@ export default function AuditTrail() {
             Audit trail
           </h2>
           <p className="panel-subtitle">
-            Hash-chained record of every order, flag and watchlist change
+            Every order, flag and watchlist change, each entry locked to the one before it
           </p>
         </div>
         <div className="flex items-center gap-1.5">
@@ -179,7 +182,7 @@ export default function AuditTrail() {
             disabled={verifying}
             className="cursor-pointer rounded-md border border-line px-2 py-0.5 text-micro font-medium text-ink-dim transition-colors enabled:hover:border-line-strong enabled:hover:text-ink disabled:opacity-40"
           >
-            {verifying ? 'Verifying…' : 'Verify chain'}
+            {verifying ? 'Checking…' : 'Check for tampering'}
           </button>
         </div>
       </div>
@@ -242,7 +245,7 @@ export default function AuditTrail() {
                 <th className="stat-label px-3 py-2">Action</th>
                 <th className="stat-label px-3 py-2">Resource</th>
                 <th className="stat-label px-3 py-2">Source</th>
-                <th className="stat-label px-3 py-2">Hash</th>
+                <th className="stat-label px-3 py-2" title="A code that changes if the entry is edited">Fingerprint</th>
               </tr>
             </thead>
             <tbody>

@@ -34,6 +34,8 @@ import {
   Wrench,
   Landmark,
   Network,
+  ScanSearch,
+  Radar,
 } from 'lucide-react';
 
 import { Button } from './Button';
@@ -66,6 +68,7 @@ const NAV_GROUPS: NavGroup[] = [
       { href: '/', label: 'Home', icon: LayoutDashboard },
       { href: '/calls', label: 'Calls', icon: Crosshair },
       { href: '/markets', label: 'Markets', icon: LineChart },
+      { href: '/scan', label: 'Scan', icon: ScanSearch },
     ],
   },
   {
@@ -80,12 +83,14 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Radar',
     items: [
       // News & intel, the world map and investigations, on one time window.
-      { href: '/intel', label: 'Intel', icon: ShieldAlert },
+      { href: '/intel', label: 'World Map', icon: ShieldAlert },
+      // Public-source stories for the world, ranked by how unusual they are.
+      { href: '/osint', label: 'Open-source Intel', icon: Radar },
       // Who is linked to whom: companies, ships, flags and places, and how two are joined.
       { href: '/connections', label: 'Connections', icon: Network },
       { href: '/filings', label: 'Filings & Fund Holdings', icon: FileText },
       // Watching the watchers: who surveils the public, and how to push back.
-      { href: '/watch', label: 'Surveillance Watch', icon: Eye, civic: true },
+      { href: '/watch', label: 'Watchlight', icon: Eye, civic: true },
     ],
   },
   {
@@ -229,12 +234,12 @@ export function Sidebar() {
                                   text-sm transition-colors outline-none
                                   focus-visible:ring-1 focus-visible:ring-accent/60 ${
                                     active
-                                      ? 'bg-gradient-to-r from-accent-dim to-transparent text-ink'
+                                      ? 'bg-overlay text-ink'
                                       : 'text-ink-dim hover:bg-overlay/50 hover:text-ink'
                                   }`}
                       >
                         {active && (
-                          <span className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r bg-accent shadow-[0_0_8px_var(--accent)]" />
+                          <span className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r bg-accent" />
                         )}
                         <Icon
                           className={`h-4 w-4 shrink-0 ${

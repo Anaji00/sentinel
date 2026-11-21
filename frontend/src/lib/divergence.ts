@@ -24,7 +24,17 @@ export function horizonWords(h: string | null | undefined): string | null {
   return h === 'session' ? 'today so far' : h === '5d' ? 'over 5 sessions' : null;
 }
 
+/** What kind of move the platform judged this to be (metrics_summary.regime), with the reasons it gave. */
+export interface Regime {
+  label?: string | null;
+  action?: string | null;
+  reasons?: string[] | null;
+  missing?: string[] | null;
+  basis?: string | null;
+}
+
 export interface Measures {
+  regime?: Regime | null;
   horizon?: Horizon | string | null;
   /** The share of its group moving the other way, 0 to 1. */
   breadth?: number | null;
@@ -44,6 +54,51 @@ export function measuresLines(m: Measures | null | undefined): string[] {
   if (num(m.beta)) out.push(`Beta ${m.beta.toFixed(2)}: for each 1% its group moves, this stock has usually moved about ${m.beta.toFixed(2)}%.`);
   if (num(m.relative_volume)) out.push(`Trading ${m.relative_volume.toFixed(1)} times its usual volume for this time of day.`);
   return out;
+}
+
+/** What every regime says about direction until a registered test shows these moves continue or reverse. */
+export const DIRECTION_NOT_ESTABLISHED = 'Direction not established: no test has yet shown that moves like this continue or reverse.';
+
+const REGIME_WORDS: Record<string, string> = {
+  UNEXPLAINED_DISLOCATION: 'Unexplained move',
+  CONFIRMED_CATALYST_DRIFT: 'Move with a known cause, still drifting',
+  FUNDAMENTAL_IMPAIRMENT_TRAP: 'Move that may reflect real damage to the business',
+  CROWDED_NO_EDGE: 'Crowded trade, no clear edge',
+};
+
+const sentence = (code: string): string => {
+  const w = code.replace(/_/g, ' ').trim().toLowerCase();
+  return w.charAt(0).toUpperCase() + w.slice(1);
+};
+
+/** A regime code or phrase in plain words; text that is already words is only capitalised. */
+export function plainRegimeLabel(label: string): string {
+  const k = label.trim();
+  return REGIME_WORDS[k.toUpperCase().replace(/\s+/g, '_')] ?? sentence(k);
+}
+
+/** "residual of -3.8 sigma against peers" as "-3.8 usual-sized moves against peers". */
+export function plainReason(reason: string): string {
+  return reason.replace(/(-?\d+(?:\.\d+)?)\s*sigma\b/gi, '$1 usual-sized moves').replace(/\bresidual of\b/i, 'gap of');
+}
+
+/** The regime as a heading, a one-line suggestion and its reasons; null when the alert carries none. */
+export function regimeView(r: Regime | null | undefined): { heading: string; action: string | null; reasons: string[]; missing: string[] } | null {
+  const label = typeof r?.label === 'string' ? r.label.trim() : '';
+  if (!r || !label) return null;
+  const clean = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : []);
+  return {
+    heading: plainRegimeLabel(label),
+    // The platform's own record shows no continuation or reversal after these alerts, so no action is shown, whatever the code says.
+    action: DIRECTION_NOT_ESTABLISHED,
+    reasons: clean(r.reasons).map(plainReason),
+    missing: clean(r.missing),
+  };
+}
+
+/** A line for alerts whose rule predicts a bigger move but not its direction (peer cointegration and decoupling). */
+export function directionNote(rule: string | null | undefined): string | null {
+  return rule && /cointegrat|decoupl/i.test(rule) ? 'A larger move than usual is expected, but which way is not known. The score is not a probability.' : null;
 }
 
 export type AlertKind = 'all' | 'divergence' | 'other';
@@ -68,6 +123,35 @@ export function filterAlerts<T extends { tags?: string[] | null; situation?: unk
 export function alertTicker(c: { description?: string | null }): string | null {
   const first = (c.description ?? '').trim().split(/\s+/)[0] ?? '';
   return /^[A-Z][A-Z0-9.-]{0,9}$/.test(first) ? first : null;
+}
+
+/** One alert, with the other alerts about the same stock on the same day folded under it. */
+export interface FoldedAlert<T> {
+  lead: T;
+  others: T[];
+}
+
+/**
+ * Alerts about the same stock on the same day become one item with the rest listed under it, in the order they first
+ * appear. Alerts with no ticker in the description are never folded.
+ */
+export function foldAlerts<T extends { correlation_id: string; description?: string | null; detected_at?: string | null }>(alerts: readonly T[]): FoldedAlert<T>[] {
+  const out: FoldedAlert<T>[] = [];
+  const at = new Map<string, FoldedAlert<T>>();
+  for (const a of alerts) {
+    const t = alertTicker(a);
+    const day = (a.detected_at ?? '').slice(0, 10);
+    const key = t && day ? `${t}|${day}` : null;
+    const hit = key ? at.get(key) : undefined;
+    if (hit) {
+      hit.others.push(a);
+      continue;
+    }
+    const item: FoldedAlert<T> = { lead: a, others: [] };
+    out.push(item);
+    if (key) at.set(key, item);
+  }
+  return out;
 }
 
 export interface Pickable {

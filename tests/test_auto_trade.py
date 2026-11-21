@@ -110,6 +110,13 @@ def test_the_book_is_kept_between_rebalances_and_rebuilt_after(monkeypatch) -> N
     store = {tr.BOOK_KEY: json.dumps(held), factor_scores_key("monthly"): json.dumps(scores)}
     trader = tr.AutoTrader(_BookDb(since=10), None, broker=_Broker(True))
     trader.raw = _Raw(store)
+
+    async def fresh_scores():
+        return 0
+
+    # Updated on purpose (19 Nov 2026, review F2): a rebuild is stored only from scores whose age is known and fresh, so this fixture
+    # has to say the scores are current; the test still proves a due book is rebuilt from them (stale scores: tests/test_trader_review_fixes.py).
+    trader._scores_sessions_behind = fresh_scores
     assert asyncio.run(trader._book(date(2026, 10, 15)))["long"] == ["OLD"]          # 10 sessions: kept
     trader.db = _BookDb(since=21)
     book = asyncio.run(trader._book(date(2026, 10, 30)))

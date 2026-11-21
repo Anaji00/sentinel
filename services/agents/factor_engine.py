@@ -299,9 +299,27 @@ class FactorEngine:
             try:
                 summary = await self.run_once()
                 logger.info("Factor model: %s", summary)
+                await self._warn_if_still_behind()
             except Exception as exc:
                 logger.error("Factor model run failed: %s", exc, exc_info=True)
             await asyncio.sleep(self._seconds_to_next_run())
+
+    async def _warn_if_still_behind(self) -> int:
+        """After a run, the scores must have caught up. When completed sessions are still missing the run dropped them (as the
+        6 Nov outage did: seven nightly runs published the same as_of while the trader kept trading on it), so say so loudly and count it."""
+        try:
+            report = json.loads(await getattr(self.redis, "raw", self.redis).get(FACTOR_REPORT_KEY) or "{}")
+            as_of = date.fromisoformat(str(report.get("as_of"))[:10])
+            row = await self.db.query_one(_SESSIONS_AFTER_SQL, as_of)
+        except Exception as exc:
+            swallowed("agents.factor_engine.stale_check", exc, logger)
+            return -1
+        missed = int((row or {}).get("n") or 0)
+        if missed >= CATCH_UP_SESSIONS:
+            swallowed("agents.factor_engine.stale_after_run", RuntimeError(f"as_of {as_of} is {missed} completed sessions behind after a run"),
+                      logger, detail="check daily_bars coverage and complete_sessions")
+            logger.error("Factor scores are still as of %s, %s completed sessions behind, after a run: the newest sessions were dropped.", as_of, missed)
+        return missed
 
     async def _behind(self) -> bool:
         """The stored scores miss CATCH_UP_SESSIONS or more completed sessions.
@@ -508,7 +526,6 @@ class FactorEngine:
             "scored": len(scores),
         }
         raw = getattr(self.redis, "raw", self.redis)
-        await raw.set(FACTOR_REPORT_KEY, json.dumps(report, default=str), ex=RESULT_TTL_SEC)
         # Every run kept, so drift in what the model finds can be seen.
         try:
             await self.db.execute(
@@ -531,6 +548,9 @@ class FactorEngine:
                     detail=f"{len(scores)} of at least {MIN_SCORES_TO_REBUILD}")
             return {"universe": report["universe"], "tradable": report.get("tradable"), "scored": len(scores),
                     "scores_withheld": 1}
+        # The live report carries the as_of the stored scores have: every freshness guard (scores_too_old, _behind, the strip) reads it, so it is
+        # written only with the scores, never for a withheld thin run (the run is still archived above).
+        await raw.set(FACTOR_REPORT_KEY, json.dumps(report, default=str), ex=RESULT_TTL_SEC)
         await raw.set(FACTOR_SCORES_KEY, json.dumps(scores), ex=RESULT_TTL_SEC)
         for h, sc in horizon_scores.items():
             await raw.set(factor_scores_key(h), json.dumps(sc), ex=RESULT_TTL_SEC)
@@ -710,6 +730,9 @@ async def main() -> None:
     from services.agents.sympathy_job import SympathyJob
     from services.agents.alert_drift_job import AlertDriftJob
     from services.agents.market_cap_job import MarketCapJob
+    from services.agents.book_shadow import BookShadow
+    from services.agents.shadow_ledger import ShadowLedger
+    from services.agents.grades_v2_job import GradesV2Job
     from services.agents.filing_change_job import FilingChangeJob
     from services.agents.extract_audit_job import ExtractAuditJob
     from services.agents.comment_letter_job import CommentLetterJob
@@ -770,6 +793,10 @@ async def main() -> None:
                          AlertDriftJob(db, redis).run(),
                          # Every stock's best-known capitalisation: calls are kept to $1bn and up.
                          MarketCapJob(db, redis).run(),
+                         # The S5 conviction-weighted shadow of B1, recorded at each rebalance; never traded (registered 13 Nov 2026).
+                         BookShadow(db, redis).run(), ShadowLedger(db, redis).run(),
+                         # Clustered, controlled grades of correlation families (additive; retires and gates nothing).
+                         GradesV2Job(db, redis).run(),
                          # How much each 10-K / 10-Q changed from the comparable one (Lazy Prices).
                          FilingChangeJob(db, redis).run(),
                          # Weekly: a second model's agreement with each extractor.

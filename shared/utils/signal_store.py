@@ -22,6 +22,8 @@ RECOMMENDATIONS_KEY = "sentinel:recommendations:latest"
 SIGNAL_MATRIX_KEY = "sentinel:signal_matrix"            # hash: ticker -> full matrix
 SIGNAL_MATRIX_INDEX_KEY = "sentinel:signal_matrix:index"  # board summary
 PRODUCER_GRADES_KEY = "sentinel:grades:producers"       # correlations, scenarios, agents vs prices
+PRODUCER_GRADES_V2_KEY = "sentinel:grades:producers_v2"  # the same families, clustered by date and compared with a same-day control
+AUTO_TRADE_BOOK_KEY = "sentinel:auto_trade:book"        # the trader's stored B1 book: {"rebalanced_on", "long", "short", "scores_as_of"}
 
 
 def factor_scores_key(horizon: str) -> str:
@@ -45,6 +47,6 @@ MAX_NEEDS_DAILY = 1500
 SHADOW_KEY = "sentinel:signals:shadow"
 
 __all__ = [
-    "ACTIVE_KEY", "AWAITING_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "SIGNAL_MATRIX_INDEX_KEY", "PRODUCER_GRADES_KEY", "SIGNAL_MATRIX_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
+    "ACTIVE_KEY", "AWAITING_KEY", "BARS_BACKFILLED_KEY", "CURSOR_KEY", "DAILY_DEEP_KEY", "EDGAR_8K_HISTORY_DONE_KEY", "FACTOR_REPORT_KEY", "FACTOR_SCORES_KEY", "factor_scores_key", "RECOMMENDATIONS_KEY", "SIGNAL_MATRIX_INDEX_KEY", "PRODUCER_GRADES_KEY", "PRODUCER_GRADES_V2_KEY", "AUTO_TRADE_BOOK_KEY", "SIGNAL_MATRIX_KEY", "EVIDENCE_CACHE_PREFIX", "EVIDENCE_KEY", "MAX_NEEDS_BARS",
     "NEEDS_BARS_KEY", "NEEDS_DAILY_KEY", "MAX_NEEDS_DAILY", "OUTCOMES_KEY", "SHADOW_KEY", "STUDY_KEY",
 ]

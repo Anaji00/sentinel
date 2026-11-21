@@ -12,7 +12,7 @@ import os
 from shared.utils.tasks import safe_create_task
 from shared.utils.quiet_failures import swallowed
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import re
 import time
 import spacy
@@ -20,6 +20,8 @@ import spacy
 from shared.models import NormalizedEvent, EventType, Entity, EntityType
 from shared.kafka import Topics
 from shared.utils.sanctions import check_sanctions
+from shared.utils.subjects import keep_subject_tokens
+from shared.utils.entity_primary import headline_company_tickers, pick_primary
 from shared.utils.equities import is_valid_primary_equity, looks_like_a_ticker, confirm_tickers
 from shared.utils.corroboration import CorroborationTracker
 from shared.utils.source_scorecard import get_source_scorecard
@@ -348,6 +350,9 @@ class NewsEnricher:
             if len(clean_word) <= 5 and clean_word.isalpha() and looks_like_a_ticker(clean_word):
                 extracted_tickers.append(clean_word)
 
+        # Bare words that are never a subject ("AI", "EPS", "IPO") are dropped unless written as a cashtag ($AI): layer audit 2.1.
+        extracted_tickers = keep_subject_tokens(extracted_tickers, {w.strip(",.():;[]{}'\"")[1:] for w in combined_text[:400].split() if w.startswith("$")})
+
         # Confirmed against the live universe before anything downstream sees
         # them. The shape test above is a denylist and lets ZZZZZ through; the
         # 11,821-symbol set is the allowlist. One round trip for the handful of
@@ -365,12 +370,14 @@ class NewsEnricher:
         # 3. spaCy Named Entity Recognition
         named_entities = list(dict.fromkeys(extracted_tickers))
         org_names: List[str] = []
+        spacy_entities: List[Tuple[str, str]] = []
         if nlp:
             try:
                 doc = nlp(combined_text[:500])
                 for ent in doc.ents:
                     if ent.label_ in ("ORG", "GPE", "PERSON", "LOC", "PRODUCT"):
                         named_entities.append(ent.text)
+                        spacy_entities.append((ent.text, ent.label_))
                     if ent.label_ == "ORG":
                         org_names.append(ent.text)
             except Exception as e:
@@ -511,6 +518,10 @@ class NewsEnricher:
 
         primary_name = unique_entities[0] if unique_entities else raw.source
         entity_type = resolve_news_entity_type(primary_name, raw.source)
+        if os.getenv("NEWS_PRIMARY_V2", "0") == "1":
+            # P7 (owner-approved 21 Nov 2026): a company only when it maps to a listed issuer; places and agencies are `country`; flag off by default.
+            primary_name, kind = pick_primary(resolved, list(company_tickers), list(extracted_tickers) + headline_company_tickers(title), spacy_entities, raw.source)
+            entity_type = {"company": EntityType.COMPANY, "country": EntityType.COUNTRY, "media_source": EntityType.MEDIA_SOURCE}.get(kind, EntityType.UNKNOWN)
         entity = Entity(
             id=primary_name,
             type=entity_type,

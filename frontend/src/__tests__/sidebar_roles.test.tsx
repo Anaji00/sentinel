@@ -19,12 +19,13 @@ import { Sidebar } from '../components/ui/Sidebar';
 const links = (html: string) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]);
 
 describe('sidebar by role', () => {
-  it('a viewer sees eleven links and no operator tooling', () => {
+  // Scan was added on purpose (the screener, sector map and market breadth live there): twelve links for a viewer, fourteen for an admin.
+  it('a viewer sees twelve links and no operator tooling', () => {
     role = 'VIEWER';
     const hrefs = links(renderToStaticMarkup(<Sidebar />));
     expect(hrefs).toEqual([
-      '/', '/calls', '/markets', '/performance', '/money',
-      '/intel', '/connections', '/filings', '/watch', '/agents', '/methodology',
+      '/', '/calls', '/markets', '/scan', '/performance', '/money',
+      '/intel', '/osint', '/connections', '/filings', '/watch', '/agents', '/methodology',
     ]);
   });
 
@@ -33,7 +34,7 @@ describe('sidebar by role', () => {
     const hrefs = links(renderToStaticMarkup(<Sidebar />));
     expect(hrefs).toContain('/operations');
     expect(hrefs).toContain('/audit');
-    expect(hrefs).toHaveLength(13);
+    expect(hrefs).toHaveLength(15);
   });
 
   it('no role is not admin', () => {

@@ -23,6 +23,8 @@ def test_the_larger_estimate_wins_and_unknown_is_not_large():
     assert mc.best_cap(0.78e9, 1170e9) == 1170e9                 # BRK.B: one share class in the SEC count
     assert mc.best_cap(None, 2e9) == 2e9 and mc.best_cap(3e9, None) == 3e9
     assert mc.best_cap(None, None) is None
+    # A share count that does not match the traded unit (AKTX, 13 Nov 2026) loses to the vendor's figure; a modest gap does not.
+    assert mc.best_cap(596e9, 12.9e6) == 12.9e6 and mc.best_cap(4.9e9, 1e9) == 4.9e9 and mc.best_cap(5.1e9, 1e9) == 1e9
     rows = mc.cap_rows({"AAA": 2e9, "BBB": 5e8}, {"BBB": 1.5e9, "CCC": None}, ["AAA", "BBB", "CCC"])
     assert rows == {"AAA": 2e9, "BBB": 1.5e9}
 
@@ -59,3 +61,16 @@ def test_a_readable_event_id_maps_to_the_uuid_the_events_writer_stores():
     assert as_uuid(rid) == _as_uuid(rid) == str(uuid.uuid5(uuid.NAMESPACE_DNS, rid))
     real = str(uuid.uuid4())
     assert as_uuid(real) == real
+
+
+def test_a_cap_far_beyond_the_stocks_own_trading_is_unknown_not_large():
+    """LTM read $27 trillion against $50m a day of trading (13 Nov 2026): foreign ADR share counts times an ADS price."""
+    assert mc.plausible_against_liquidity(5.2e12, 15e9) is True          # Apple-sized: about 350 days of volume
+    assert mc.plausible_against_liquidity(27.2e12, 49.6e6) is False
+    assert mc.plausible_against_liquidity(1e9, None) is True and mc.plausible_against_liquidity(1e9, 0) is True
+    # 21 Nov 2026 (P5): preferred shares and ADRs that slipped under the old 10,000 bound; real names stay in (Apple 297, Berkshire B 418)
+    for ratio in (9_212, 5_558, 4_474, 4_407):
+        assert mc.plausible_against_liquidity(ratio * 1e6, 1e6) is False
+    assert mc.plausible_against_liquidity(297 * 1e9, 1e9) is True and mc.plausible_against_liquidity(418 * 1e9, 1e9) is True
+    rows = mc.cap_rows({"AAA": 5e9, "LTM": 27.2e12}, {}, ["AAA", "LTM", "NONE"], adv={"AAA": 20e6, "LTM": 49.6e6})
+    assert rows == {"AAA": 5e9}

@@ -117,6 +117,7 @@ PEER_MAX_TICKERS = int(os.getenv("PEER_MAX_TICKERS", "60"))
 PEER_SERIES_BARS = int(os.getenv("PEER_SERIES_BARS", "120"))
 from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.subjects import is_non_company_subject
 
 _dynamic_rules_cache = {}
 
@@ -902,6 +903,10 @@ async def evaluate_dynamic_rules(event: NormalizedEvent, store: EventStore) -> l
                 # same_entity clauses. It was computed further down, after the
                 # loop that now reads it.
                 entity_id = event.primary_entity.id if event.primary_entity else "UNKNOWN"
+                # A bare term ("AI", "EPS") or a feed name is not a subject: "AI" anchored 283 correlations in seven days, NVDA 12.7%.
+                if is_non_company_subject(entity_id):
+                    dropped("correlation.non_company_subject", "trigger subject is a term or a feed name, not a company", logger, detail=entity_id)
+                    continue
 
                 # The trigger's own time, against which "before" and "after"
                 # are judged.
@@ -2928,6 +2933,7 @@ async def main():
                     skip_semantic = (
                         is_null_address(e_id)
                         or e_id in ("UNKNOWN", "")
+                        or is_non_company_subject(e_id)
                         or (distinct_subjects < 2 and semantic_domain_count < 2)
                         or await _semantic_rule_deprecated(redis_client)
                     )
@@ -3151,6 +3157,14 @@ async def main():
         except Exception as e:
             import traceback
             logger.error(f"Failed to process correlation for event {event.event_id}: {e}\n{traceback.format_exc()}")
+            # The batch is committed after this returns, so the event is not redelivered: count it (it was lost uncounted).
+            swallowed("correlation.event", e, logger, detail=str(event.event_id))
+            # Review F4 (owner "execute", 21 Nov 2026): and parked in the DLQ, so the event can be replayed once the cause is fixed instead of being lost.
+            try:
+                await producer.send(Topics.DLQ, data={"topic": Topics.ENRICHED_EVENTS, "error": f"{type(e).__name__}: {str(e)[:300]}",
+                                                      "raw": encode_dlq_payload(event.model_dump(mode="json"))})
+            except Exception as dlq_err:
+                swallowed("correlation.event_dlq", dlq_err, logger, detail=str(event.event_id))
             return
 
     # Background task: periodic Hawkes MLE refit

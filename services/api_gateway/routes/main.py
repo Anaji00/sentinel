@@ -6,13 +6,14 @@ It acts as the "Front Door" to the entire Sentinel platform, securely routing
 incoming web requests to the appropriate databases and backend services.
 """
 
+import asyncio
 import sys
 import os
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -29,7 +30,17 @@ from shared.db import get_neo4j, get_timescale, get_redis
 from services.api_gateway.dependencies import verify_api_key
 from services.api_gateway.routes import (
     ownership,
+    quotes,
+    strip,
+    changes,
+    market,
+    calendar,
+    evidence,
+    alerts,
+    screener,
+    stock_snapshot,
     stock_changes,
+    stock_events,
     stock_peers,
     chip_prices,
     stock_thesis,
@@ -82,7 +93,11 @@ async def lifespan(app: FastAPI):
     # Migrates the single environment-defined operator into the accounts table so
     # authentication can stop comparing a plaintext ADMIN_PASSWORD.
     await auth.ensure_admin_account(app.state.db)
+    # Keeps the stock page's caches warm for followed and most-traded names (services/api_gateway/warmup.py); one name at a time, no model call.
+    from services.api_gateway.warmup import warm_loop
+    warm_task = asyncio.create_task(warm_loop(app.state.db, app.state.redis), name="stock-page-warmup")
     yield
+    warm_task.cancel()
     # CLEANUP: Gracefully close all database connections on shutdown.
     logger.info("Shutting down — closing database connections...")
     try:
@@ -166,6 +181,23 @@ app.add_middleware(
     **build_cors_kwargs(os.getenv("SENTINEL_ENV", "dev"), os.getenv("CORS_ALLOWED_ORIGINS", "")),
 )
 
+@app.middleware("http")
+async def _time_routes(request: Request, call_next):
+    """Records how long each route takes (shared/utils/route_latency.py), by route template; read at GET /api/v1/health/latency."""
+    import time
+
+    from shared.utils.route_latency import BOOK, route_template
+
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        BOOK.record(route_template(request.scope.get("route"), request.url.path), (time.perf_counter() - started) * 1000.0, status)
+
+
 # MODULAR ROUTING:
 app.include_router(auth.router)
 # Registered unconditionally; every route inside answers 404 unless OIDC is
@@ -207,9 +239,19 @@ app.include_router(portfolio.router)
 app.include_router(reports.router)
 app.include_router(filings.router)
 app.include_router(ownership.router)
+app.include_router(quotes.router)
+app.include_router(strip.router)
+app.include_router(changes.router)
+app.include_router(market.router)
+app.include_router(calendar.router)
+app.include_router(evidence.router)
+app.include_router(alerts.router)
+app.include_router(screener.router)
+app.include_router(stock_snapshot.router)
 app.include_router(stock_peers.router)
 app.include_router(chip_prices.router)
 app.include_router(stock_changes.router)
+app.include_router(stock_events.router)
 app.include_router(stock_thesis.router)
 app.include_router(methodology.router)
 app.include_router(sovereignty.router)

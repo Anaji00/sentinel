@@ -4,7 +4,8 @@ import { actionWords, compactIds } from '../components/AuditTrail';
 describe('audit trail in plain words', () => {
   it('turns action codes into words', () => {
     expect(actionWords('EXECUTE_BUY_ORDER')).toBe('Execute buy order');
-    expect(actionWords('REPLAY_DEAD_LETTERS')).toBe('Replay dead letters');
+    // Reworded on purpose: "dead letters" is queue jargon; the entry is a retry of events that failed to process.
+    expect(actionWords('REPLAY_DEAD_LETTERS')).toBe('Retry failed events');
     expect(actionWords('ORDER')).toBe('Order');
   });
 

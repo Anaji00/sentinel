@@ -1,0 +1,33 @@
+<title>Score Calibration Results</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{--bg:#f6f7f9;--fg:#15202b;--mut:#5b6773;--card:#fff;--line:#d9dee4;--pass:#1b7a4b;--fail:#b3361f;--acc:#2b5d8a}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#10161c;--fg:#e6ebf0;--mut:#9aa7b3;--card:#18212a;--line:#2a3541;--pass:#4cc58a;--fail:#ff8a73;--acc:#7fb0dc;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#10161c;--fg:#e6ebf0;--mut:#9aa7b3;--card:#18212a;--line:#2a3541;--pass:#4cc58a;--fail:#ff8a73;--acc:#7fb0dc;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 Inter,system-ui,sans-serif;padding-block:24px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+main{max-width:860px;margin:auto;display:grid;gap:20px}
+h1{font-size:26px;margin:0;text-wrap:balance}h2{font-size:16px;margin:0 0 8px}p{margin:0;color:var(--mut)}
+.t{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:6px}
+table{border-collapse:collapse;width:100%;min-width:640px}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)}
+.p{color:var(--pass);font-weight:600}.f{color:var(--fail);font-weight:600}
+ul{margin:0;padding-left:20px;display:grid;gap:6px}
+</style>
+<main>
+<div><h1>Anomaly score calibration</h1><p>21 Nov 2026. Four changes registered before any run; one passed every bar and is wired behind a flag that is off.</p></div>
+<div class="t"><table>
+<tr><th>Item</th><th>Change</th><th>Verdict</th><th>Missed bar</th></tr>
+<tr><td>R1 earnings_report (60% at 0.450)</td><td>Subtract up to 0.20 by the name's jumpiness</td><td class="f">Fail</td><td>Outcome interval lower end −0.0214 vs −0.02</td></tr>
+<tr><td>R2 Kalshi quiet cap (55% at 0.300)</td><td>Spread 0.30 to 0.39 by size and price</td><td class="f">Fail</td><td>One value still 21.8% vs 15%</td></tr>
+<tr><td>R3a sec_edgar filings (34% over 0.8)</td><td>Scale by 20-day dollar volume</td><td class="f">Fail</td><td>Over 0.8: 18.7% vs 15%</td></tr>
+<tr><td>R3b equity blocks (35% over 0.8)</td><td>Block size as share of daily dollar volume</td><td class="p">Pass, 4 of 4</td><td>Over 0.8: 2.7%; outcome +0.156 [+0.022, +0.275]</td></tr>
+<tr><td>R4 time of day (coinbase)</td><td>Slot-quantile mapping, 14-day history</td><td class="f">Fail</td><td>Count over 0.8 +252% vs 30% limit</td></tr>
+</table></div>
+<div><h2>What the measurements corrected</h2><ul>
+<li>The time-of-day clusters are crypto candles (30,123 of 40,663 events) and a daily short-volume batch at 17:00 ET, not the US session.</li>
+<li>The prediction "0.300 floor" is a cap on quiet Kalshi trades that discards their score.</li>
+<li>Earnings pre-announcement scores depend only on days to the report.</li>
+</ul></div>
+<div><h2>Wiring</h2><p>Blocks only, in the enrichment service, behind SCORE_CALIBRATION_V2 (default 0, unset in the container). It lowers scores only, and 95% of blocks would fall below 0.6, so turning it on is the owner's decision.</p></div>
+<div><h2>Two mistakes</h2><p>I overwrote two tracked score_calibration files (restored from git; any uncommitted edits in them are lost) and one untracked measurement script (not recoverable).</p></div>
+</main>

@@ -35,6 +35,11 @@ from .pattern_library import PatternLibrary
  
 logger = logging.getLogger("reasoning.tracker")
 
+_REFRESH_NARRATIVE_SQL = r"""
+    UPDATE scenarios SET narrative_summary = regexp_replace(narrative_summary, 'Overall confidence \d{1,3}\s*%', 'Overall confidence ' || $1::int || '%')
+    WHERE scenario_id = $2 AND narrative_summary ~ 'Overall confidence \d'
+"""
+
 from .calibration_harness import DynamicBayesianCalibrator
 
 CONFIRM_THRESHOLD = 65  # Confidence % above which we confirm a scenario
@@ -861,6 +866,11 @@ class ScenarioTracker:
             # learning loop recorded its results in a form it cannot itself
             # consume. Measured live: hypotheses came back as jsonb "string" on
             # 324 of 672 rows, and confidence_history on every row that had one.
+            # The narrative states "Overall confidence N%" from the day it was written; keep it equal to the stored field (layer audit 18 Nov, finding 10).
+            try:
+                await self._db.execute(_REFRESH_NARRATIVE_SQL, new_confidence, scenario_id)
+            except Exception as e:
+                swallowed("reasoning.scenario_tracker.narrative_confidence", e, logger, detail=scenario_id)
             history_entry = [{
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "confidence": new_confidence,

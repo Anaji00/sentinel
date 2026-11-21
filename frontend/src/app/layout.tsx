@@ -1,5 +1,5 @@
 import './globals.css';
-import { Inter } from 'next/font/google';
+import { Inter, JetBrains_Mono } from 'next/font/google';
 import type { Metadata, Viewport } from 'next';
 import { SessionProvider } from '@/components/ui/SessionContext';
 import { ServiceWorkerRegistrar } from '@/components/ServiceWorkerRegistrar';
@@ -7,6 +7,8 @@ import { THEME_BOOT } from '@/lib/theme';
 
 // Self-hosted at build time by Next, so no request to Google when a page loads.
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter', display: 'swap' });
+// Figures, tickers and identifiers use one loaded monospace face, so they look the same on every machine.
+const mono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-jb', display: 'swap' });
 
 export const metadata: Metadata = {
   title: 'Sentinel: markets and civic watch',
@@ -31,7 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     // The boot script sets data-theme before React hydrates, so the attribute
     // differs from the server's markup by design.
-    <html lang="en" className={`dark ${inter.variable}`} data-theme="dark" suppressHydrationWarning>
+    <html lang="en" className={`dark ${inter.variable} ${mono.variable}`} data-theme="dark" suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOT }} />
       </head>

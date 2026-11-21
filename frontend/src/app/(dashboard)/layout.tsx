@@ -9,6 +9,7 @@ import { DataProvider } from '../../components/ui/DataProvider';
 import { StockDrawer } from '../../components/StockDrawer';
 import { DataHealthStrip } from '../../components/ui/DataHealthStrip';
 import { ShortcutsSheet } from '../../components/ui/ShortcutsSheet';
+import AlertWatcher from '../../components/AlertWatcher';
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -19,6 +20,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             <div className="flex h-screen w-full bg-page text-ink overflow-hidden">
               <CommandPalette />
               <ShortcutsSheet />
+              <AlertWatcher />
               {/* Any page's ?t=TICKER opens the stock drawer over it. useSearchParams
                   needs a Suspense boundary under the app router. */}
               <React.Suspense fallback={null}>
@@ -29,7 +31,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                 <Header />
                 {/* Padding scales with the viewport. A flat p-4 spent 32 of the 39
               pixels this app used to be left with on a narrow screen. */}
-                <main className="flex-1 overflow-y-auto p-2 sm:p-4 lg:p-6">
+                <main className="flex-1 overflow-y-auto overflow-x-hidden p-2 sm:p-4 lg:p-6">
                   <div className="max-w-[1920px] mx-auto h-full flex flex-col">
                     <DataHealthStrip />
                     {children}

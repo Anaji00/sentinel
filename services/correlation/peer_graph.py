@@ -36,6 +36,9 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shared.utils.quiet_failures import dropped
+from shared.utils.residual_corr import is_market_beta_pair
+
 logger = logging.getLogger("correlation.peer_graph")
 
 # Bars required before a correlation means anything. Twenty hourly bars is
@@ -306,9 +309,14 @@ def derive_peers(
     tickers = sorted(returns)
     edges: List[PeerEdge] = []
     considered = 0
+    market_beta_pairs = 0
 
     for i, a in enumerate(tickers):
         for b in tickers[i + 1:]:
+            # A pair with a broad-market index is the market factor, not a peer (PEER_OF edges to SPY, QQQ, IWM, ES=F, NQ=F: 30 made in 5 days).
+            if is_market_beta_pair(a, b):
+                market_beta_pairs += 1
+                continue
             considered += 1
             overlap = min(len(returns[a]), len(returns[b]))
             xs, ys = returns[a][-overlap:], returns[b][-overlap:]
@@ -343,6 +351,8 @@ def derive_peers(
                 )
             )
 
+    if market_beta_pairs:
+        dropped("correlation.peer_market_beta", "peer pair with a broad-market index is the market factor, not a peer", logger, detail=str(market_beta_pairs))
     logger.info(
         "Peer derivation: %s tickers with a usable window, %s pairs considered, "
         "%s peers (%s inverse). Pairs below |r|=%.2f or above p=%.3f get no edge.",

@@ -174,6 +174,38 @@ def calibrated(raw: Optional[float], horizon: str, cal: Optional[Any] = None) ->
     return float(c["slope"]) * raw + INTERCEPT_WEIGHT * intercept
 
 
+MIN_PLATEAU_KNOTS = 3
+# A pooled stretch of two knots already gives every stock inside it one forecast (APP, CORZ and TWLO all read 86.2 bps with different raw alphas
+# while calibration_flat was false, 20 Nov 2026): flat means flat, so two pooled knots count.
+PLATEAU_GROUP_KNOTS = 2
+
+
+def on_plateau(raw: Optional[float], cal: Optional[Any]) -> Optional[bool]:
+    """Whether `raw` (a fraction) falls on a flat stretch of the measured map: three or more neighbouring knots that pool-adjacent-violators
+    averaged into one realised value, or beyond the last knot when the last stretch is flat. On such a stretch every stock gets the same
+    forecast (13 Nov 2026: every monthly long above about +55 bps raw read +32.5 bps), so the number says nothing about this stock.
+    None when there is no measured map (the default slope then varies with the stock)."""
+    if raw is None or not isinstance(cal, dict):
+        return None
+    knots = cal.get("knots_bps") or []
+    if len(knots) < MIN_PLATEAU_KNOTS:
+        return None
+    pts = monotone(knots)
+    groups: List[List[Tuple[float, float]]] = []
+    for pt in pts:
+        if groups and abs(groups[-1][-1][1] - pt[1]) < 1e-9:
+            groups[-1].append(pt)
+        else:
+            groups.append([pt])
+    x = raw * 1e4
+    for i, g in enumerate(groups):
+        lo = float("-inf") if i == 0 else g[0][0]
+        hi = float("inf") if i == len(groups) - 1 else g[-1][0]
+        if lo <= x <= hi:
+            return len(g) >= PLATEAU_GROUP_KNOTS
+    return False
+
+
 def calibration(raw: Sequence[float], realized: Sequence[float]) -> Optional[Dict[str, Any]]:
     """Least-squares slope and intercept of realised excess on raw alpha, and
     the decile means, from out-of-sample pairs (the portfolio lab)."""
@@ -236,5 +268,5 @@ def kelly_stock(alpha_h: Optional[float], sigma_annual: Optional[float], horizon
     return round(min(cap, fraction * edge / var), 4)
 
 
-__all__ = ["KNOT_EDGES", "monotone", "CALIBRATION_DEFAULTS", "alpha", "calibrated", "calibration", "daily_returns",
+__all__ = ["KNOT_EDGES", "MIN_PLATEAU_KNOTS", "on_plateau", "monotone", "CALIBRATION_DEFAULTS", "alpha", "calibrated", "calibration", "daily_returns",
            "forecast_vol", "har_vol", "kelly_stock", "prob_beats", "with_events", "z_of"]

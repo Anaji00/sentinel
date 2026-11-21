@@ -6,7 +6,7 @@
  */
 
 import React from 'react';
-import { briefBlocks, horizonWords, isNotMeasured, measuresLines, situationLine, stageView, type Brief, type Measures, type Situation } from '../lib/divergence';
+import { briefBlocks, horizonWords, isNotMeasured, measuresLines, regimeView, situationLine, stageView, type Brief, type Measures, type Situation } from '../lib/divergence';
 import { Disclosure } from './ui/Disclosure';
 
 const TONE: Record<string, string> = {
@@ -31,11 +31,27 @@ export function StageBadge({ situation, horizon }: { situation?: Situation | nul
 
 export function DivergenceBrief({ situation, brief, id, measures }: { situation?: Situation | null; brief?: Brief | null; id: string; measures?: Measures | null }) {
   const blocks = briefBlocks(brief);
-  if (blocks.length === 0) return null;
+  const regime = regimeView(measures?.regime);
+  if (blocks.length === 0 && !regime) return null;
   const line = situationLine(situation);
   return (
     <Disclosure variant="row" label="Intelligence brief" storageKey={`brief:${id}`} hint={line ?? undefined}>
       <div className="space-y-2.5 pt-1">
+        {regime && (
+          <section aria-label="What kind of move this looks like" className="space-y-0.5 rounded-sm border border-line bg-inset p-2">
+            <h4 className="text-micro font-semibold uppercase tracking-[0.08em] text-ink-mute">What kind of move this looks like</h4>
+            <p className="text-xs font-semibold text-ink">{regime.heading}</p>
+            {regime.action && <p className="text-xs text-ink-dim">{regime.action}</p>}
+            {regime.reasons.length > 0 && (
+              <ul className="list-disc space-y-0.5 pl-4 text-xs text-ink-dim">
+                {regime.reasons.map((x) => (
+                  <li key={x}>{x}</li>
+                ))}
+              </ul>
+            )}
+            {regime.missing.length > 0 && <p className="text-xs text-ink-mute">Not measured: {regime.missing.join(', ')}.</p>}
+          </section>
+        )}
         {measuresLines(measures).length > 0 && (
           <ul className="list-disc space-y-0.5 pl-4 text-xs text-ink-dim" aria-label="Measurements">
             {measuresLines(measures).map((l) => (

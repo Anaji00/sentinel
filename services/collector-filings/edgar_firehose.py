@@ -35,7 +35,11 @@ import aiohttp
 
 from shared.models.events import RawEvent
 from shared.kafka import Topics
+from shared.utils import filing_time
+from shared.utils.collector_metrics import for_service as _collector_metrics
+from shared.utils.filing_forms import is_low_value_form
 from shared.utils.quiet_failures import swallowed
+from shared.utils.sec_rate import sec_slot
 
 logger = logging.getLogger("collector-filings.firehose")
 
@@ -118,6 +122,7 @@ async def _fetch_form_feed(
     session: aiohttp.ClientSession, headers: Dict[str, str], form: str
 ) -> List[Dict[str, Any]]:
     url = EDGAR_CURRENT_URL.format(form=form, count=FIREHOSE_COUNT)
+    await sec_slot()
     try:
         async with session.get(
             url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
@@ -170,6 +175,11 @@ async def poll_edgar_firehose(
             if accession in seen_this_cycle:
                 continue
             seen_this_cycle.add(accession)
+            if is_low_value_form(record["form"]):
+                # Counted, not marked seen: skipping costs nothing next cycle and
+                # nothing is written to the dedup set for 1,300 filings a week.
+                _collector_metrics("collector-filings").rejected("424b2_low_value")
+                continue
             if await dedup.is_seen(accession):
                 continue
 
@@ -217,10 +227,12 @@ async def poll_edgar_firehose(
                     f"SEC filing Form {form} for {company_name} ({ticker}) on {filed_date}."
                 )
 
+            stamped_at, used_acceptance = filing_time.occurred_at(record["filed_at"], datetime.now(timezone.utc))
             event = RawEvent(
                 source="sec_edgar",
-                occurred_at=datetime.now(timezone.utc),
+                occurred_at=stamped_at,
                 raw_payload={
+                    "acceptance_time": record["filed_at"] if used_acceptance else None,
                     "ticker": ticker,
                     "cik": record["cik"],
                     "company_name": company_name,

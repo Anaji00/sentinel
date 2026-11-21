@@ -130,6 +130,10 @@ _ARCHIVE_TOPUP_SQL = """
 """
 
 _SERIES_SQL = """
+    SELECT extract(epoch FROM bucket_time)::float8 AS t, close AS c FROM tradfi_bars_5m
+    WHERE ticker = $1 AND bucket_time > $2 ORDER BY bucket_time
+"""
+_SERIES_SQL = """
     SELECT extract(epoch FROM time_bucket('5 minutes', time))::float8 AS t,
            last(close, time) AS c
     FROM tradfi_bars
@@ -309,14 +313,21 @@ class SignalEngine:
             await asyncio.sleep(ARCHIVE_INTERVAL_SEC)
 
     async def _study_loop(self):
+        from shared.utils.retry_sleep import is_connection_error, next_delay
+
         await asyncio.sleep(30)
+        failures = 0
         while True:
             try:
                 summary = await self.run_study()
                 logger.info("Reaction study: %s", summary)
+                failures = 0
             except Exception as exc:
+                # Only a dropped connection is retried soon; a timeout or any other failure waits the full interval (the study is the heaviest read; review L4).
+                failures = failures + 1 if is_connection_error(exc) else 0
                 logger.error("Reaction study failed: %s", exc, exc_info=True)
-            await asyncio.sleep(STUDY_INTERVAL_SEC)
+            # A failed study retries in 15 minutes, up to four times (a database restart cost a night's run on 13 Nov), not after the full six hours.
+            await asyncio.sleep(next_delay(failures, STUDY_INTERVAL_SEC))
 
     async def _load_observations(self, start: datetime, end: datetime,
                                  types: Optional[List[str]] = None, step_days: int = 1) -> list:

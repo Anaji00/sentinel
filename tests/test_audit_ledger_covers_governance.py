@@ -61,6 +61,8 @@ NOT_GOVERNANCE = {
     # A person asks for the bull and bear case on a stock. The POST starts a background
     # job and stores its answer for six hours; it is capped per person and per host, and
     # changes nothing anybody could later dispute.
+    # A person's own price alerts: the levels they watch. Private to the viewer; an admin-served ledger would expose what they follow.
+    "alerts.py": "a person's own price alerts; private, changes no platform state",
     "stock_thesis.py": "writes a cached AI answer for one stock; spends capped inference, changes no configuration, access or data",
 }
 

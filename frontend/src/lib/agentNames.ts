@@ -14,6 +14,8 @@ const AGENT_NAME: Record<string, string> = {
   rule_synthesizer: 'Alert rule writer',
   stock_correlation_agent: 'Stocks that move together',
   supervisor: 'Knowledge graph gatekeeper',
+  adversarial_wargamer_v2_hosted: 'Stress-test analyst (hosted model)',
+  adversarial_wargamer: 'Stress-test analyst',
 };
 
 const DOMAIN_NAME: Record<string, string> = {

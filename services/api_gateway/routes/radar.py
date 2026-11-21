@@ -973,6 +973,9 @@ async def get_candles(
     ticker: str,
     timeframe: str = Query("1m", description="Options: 1m, 5m, 10m, 15m, 30m, 1h, 4h, 1d, 1w, 1M"),
     limit: int = Query(100, ge=1, le=1000),
+    range_: Optional[str] = Query(None, alias="range", pattern="^(1D|1M|3M|1Y|5Y)$",
+                                  description="Preset window; picks the bar size and ignores timeframe and limit."),
+    warmup: int = Query(0, ge=0, le=500, description="With range: bars returned ahead of the window, marked warmup: true."),
     db = Depends(get_db_optional),
     redis = Depends(get_redis_optional)
 ):
@@ -980,7 +983,25 @@ async def get_candles(
     Retrieve aggregated OHLCV candlesticks for a specific ticker across multiple timeframes.
     Redis/Lua multi-timeframe aggregator serves the low-latency hot cache (§2.5).
     TimescaleDB Continuous Aggregates (tradfi_bars_*) serve as durable fallback and historical source of truth.
+
+    With `range` (1D, 1M, 3M, 1Y, 5Y) the bar size is chosen (5m, 1h, 1h, daily, weekly), candles come oldest first and each carries
+    `warmup`; `history_limited` is true when stored history does not reach back to `window_start` (intraday exists since 13 Jul 2026).
     """
+    if range_ is not None:
+        from shared.utils import candle_range as cr
+
+        pl = cr.plan(range_, warmup)
+        base = await get_candles(ticker, timeframe=pl["timeframe"], limit=pl["fetch"], range_=None, warmup=0, db=db, redis=redis)
+        sp = cr.split(base["candles"], range_, warmup)
+        if sp["history_limited"] and db is not None and pl["timeframe"] in ("5m", "1h"):
+            # The Redis list is shallow; the durable aggregate reaches back to 13 Jul. Keep whichever covers more.
+            alt = await get_candles(ticker, timeframe=pl["timeframe"], limit=pl["fetch"], range_=None, warmup=0, db=db, redis=None)
+            alt_sp = cr.split(alt["candles"], range_, warmup)
+            if alt_sp["candles"] and len(alt_sp["candles"]) > len(sp["candles"]):
+                base, sp = alt, alt_sp
+        return {"ticker": base["ticker"], "range": range_, "timeframe": base["timeframe"], "source": base["source"],
+                "count": len(sp["candles"]), "warmup_count": sp["warmup_count"], "window_start": sp["window_start"],
+                "history_limited": sp["history_limited"], "candles": sp["candles"]}
     valid_timeframes = {"1m", "5m", "10m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"}
     if timeframe not in valid_timeframes:
         raise HTTPException(status_code=400, detail=f"Invalid timeframe. Must be one of: {valid_timeframes}")

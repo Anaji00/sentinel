@@ -58,4 +58,16 @@ def test_known_thesis_killers_and_conflicts_abstain() -> None:
 
 def test_the_verdict_serialises_for_an_alert_annotation() -> None:
     d = rp.classify(rp.Packet(residual_z=2.9, **FULL)).as_dict()
-    assert set(d) == {"label", "action", "reasons", "missing", "basis"} and d["label"] in rp.LABELS
+    # Deliberate update (layer audit 18 Nov, finding 4): two display keys were added beside the unchanged ones.
+    assert set(d) == {"label", "action", "reasons", "missing", "basis", "action_supported", "action_label"} and d["label"] in rp.LABELS
+
+
+def test_directional_actions_are_labelled_unsupported_without_changing_the_action() -> None:
+    from shared.utils import regime_packet as rp
+    for a in ("fade_buy", "fade_sell", "go_long", "go_short"):
+        f = rp.action_fields(a)
+        assert f["action_supported"] is False and "not established" in f["action_label"]
+    assert rp.action_fields("abstain") == {"action_supported": True, "action_label": "abstain"}
+    assert rp.action_fields("veto_buy")["action_supported"] is True
+    v = rp.Verdict(rp.UNEXPLAINED_DISLOCATION, "fade_buy", ["x"]).as_dict()
+    assert v["action"] == "fade_buy" and v["action_supported"] is False

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,6 +25,8 @@ logger = logging.getLogger("api-gateway-me")
 router = APIRouter(prefix="/api/v1/me", tags=["Me"])
 
 MAX_TICKERS = 30
+MAX_FLAGS = 30
+_FLAG = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _TICKER = re.compile(r"^[A-Z]{1,5}(\.[A-Z])?$")
 _STATE = re.compile(r"^[A-Z]{2}$")
 
@@ -62,6 +65,34 @@ class Preferences(BaseModel):
     # Whether the first-visit welcome has been answered.
     welcomed: bool = False
     notify: NotifyPrefs = Field(default_factory=NotifyPrefs)
+    # When the person last looked (the digest's cut-off), kept on the server so it survives a change of device.
+    last_seen_at: Optional[str] = None
+    # Small seen/onboarding switches the screens keep per person: lower-case names, true or false.
+    flags: Dict[str, bool] = Field(default_factory=dict)
+
+    @field_validator("last_seen_at")
+    @classmethod
+    def _last_seen(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        try:
+            ts = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("last_seen_at must be an ISO timestamp")
+        ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        if ts > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("last_seen_at is in the future")
+        return ts.astimezone(timezone.utc).isoformat()
+
+    @field_validator("flags")
+    @classmethod
+    def _flags(cls, v: Dict[str, bool]) -> Dict[str, bool]:
+        if len(v) > MAX_FLAGS:
+            raise ValueError(f"at most {MAX_FLAGS} flags")
+        for k in v:
+            if not _FLAG.match(str(k)):
+                raise ValueError(f"flag names are lower-case letters, digits and underscores: {str(k)[:24]}")
+        return {str(k): bool(x) for k, x in v.items()}
 
     @field_validator("tickers")
     @classmethod

@@ -8,6 +8,7 @@
  * to ask with the evidence and citation attached, not legal conclusions.
  */
 
+import { groupFeed, type FeedEntry } from '../lib/civicFeed';
 import React, { useState } from 'react';
 import { Input } from './ui/Input';
 import { Button } from './ui/Button';
@@ -1034,6 +1035,38 @@ export const FEED_KIND: Record<string, string> = {
   lobbying: 'Lobbying',
 };
 
+function FeedGroup({ entry, onOpenPortal }: { entry: Extract<FeedEntry<FeedItem>, { type: 'group' }>; onOpenPortal: (slug: string) => void }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? entry.items : entry.items.slice(0, 6);
+  return (
+    <li className="space-y-1.5 border-t border-line/60 pt-1.5">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="px-1.5 rounded border border-line text-micro text-ink-dim">{FEED_KIND[entry.kind] ?? entry.kind}</span>
+        <span className="text-ink">{entry.lead}</span>
+        <span className="font-mono text-sm font-semibold text-accent">{entry.items.length} {entry.kind === 'court_case' ? 'cases' : entry.kind === 'finding' || entry.kind.startsWith('portal') ? 'places' : 'items'}</span>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {shown.map((it, i) =>
+          it.ref ? (
+            <button key={`${it.ref}-${i}`} type="button" onClick={() => onOpenPortal(it.ref!)} className="max-w-full truncate rounded-full border border-line px-2 py-0.5 text-micro text-ink-dim hover:border-accent hover:text-ink">
+              {entry.places[entry.items.indexOf(it)]}
+            </button>
+          ) : (
+            <span key={i} className="max-w-full truncate rounded-full border border-line px-2 py-0.5 text-micro text-ink-dim" title={entry.places[entry.items.indexOf(it)]}>
+              {entry.places[entry.items.indexOf(it)]}
+            </span>
+          ),
+        )}
+        {entry.items.length > 6 && (
+          <button type="button" onClick={() => setAll((v) => !v)} className="px-1 text-micro text-accent hover:underline">
+            {all ? 'Show fewer' : `and ${entry.items.length - 6} more`}
+          </button>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function WatchFeed({
   state,
   onOpenPortal,
@@ -1080,8 +1113,12 @@ function WatchFeed({
         <p className="text-ink-mute">Nothing in this window yet.</p>
       ) : (
         <ul className="space-y-1 max-h-96 overflow-y-auto">
-          {items.map((i, n) => (
-            <li key={`${i.kind}-${i.ref ?? i.url ?? n}`} className="border-t border-line/60 pt-1">
+          {groupFeed(items).map((e, n) =>
+            e.type === 'group' ? (
+              <FeedGroup key={`g-${e.kind}-${e.lead}`} entry={e} onOpenPortal={onOpenPortal} />
+            ) : (
+              ((i) => (
+            <li key={`${i.kind}-${i.ref ?? i.url ?? ''}-${n}`} className="border-t border-line/60 pt-1">
               <div className="flex flex-wrap items-baseline gap-2">
                 <span className="px-1.5 rounded border border-line text-micro text-ink-dim">
                   {FEED_KIND[i.kind] ?? i.kind}
@@ -1113,8 +1150,10 @@ function WatchFeed({
                   .join(' · ')}
                 {i.detail ? ` — ${i.detail}` : ''}
               </div>
-            </li>
-          ))}
+              </li>
+              ))(e.item)
+            ),
+          )}
         </ul>
       )}
     </div>

@@ -8,6 +8,7 @@ Compatible with Slack incoming webhooks, Discord, PagerDuty, etc.
 from datetime import datetime
 from typing import Dict, Any
 from shared.models import CorrelationCluster, Scenario, AlertTier
+from shared.utils.alert_wording import direction_note
 
 
 TIER_COLOR = {
@@ -37,7 +38,7 @@ def format_correlation_slack(cluster: CorrelationCluster) -> Dict[str, Any]:
             {
                 "color":    color,
                 "title":    f"[{cluster.alert_tier.name}] {cluster.rule_name}",
-                "text":     cluster.description,
+                "text":     cluster.description + (" " + direction_note(cluster.rule_name) if direction_note(cluster.rule_name) else ""),
                 "fields": [
                     {"title": "Tags",       "value": ", ".join(cluster.tags[:6]),  "short": True},
                     {"title": "Entities",   "value": ", ".join(cluster.entity_ids[:3]), "short": True},

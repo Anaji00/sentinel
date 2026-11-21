@@ -131,6 +131,9 @@ async def run_forever(headers: Dict[str, str], redis_client: Any, cik_to_ticker_
     from shared.db import get_timescale
 
     raw = getattr(redis_client, "raw", redis_client)
+    from shared.utils.retry_sleep import next_delay
+
+    failures = 0
     await asyncio.sleep(240)
     while True:
         try:
@@ -140,8 +143,12 @@ async def run_forever(headers: Dict[str, str], redis_client: Any, cik_to_ticker_
                     logger.info("SEC fundamentals: %s frames, %s rows, %s errors.",
                                 stats["frames"], stats["rows"], stats["errors"])
         except Exception as e:
+            failures += 1
             swallowed("collector_filings.fundamentals", e, logger)
-        await asyncio.sleep(REFRESH_INTERVAL_SEC)
+        else:
+            failures = 0
+        # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, REFRESH_INTERVAL_SEC))
 
 
 __all__ = ["frames_wanted", "rows_from", "run_forever", "sync"]

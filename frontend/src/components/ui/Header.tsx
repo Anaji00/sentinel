@@ -31,6 +31,7 @@ import { useTelemetryStore } from '../../lib/store';
 import { AccountProfileModal } from '../AccountProfileModal';
 import { useNav } from './NavContext';
 import { TIMEZONES, useTimeZone } from './TimeZoneContext';
+import { SessionClock } from './SessionClock';
 import { useSession } from './SessionContext';
 import { HeaderSearch } from './HeaderSearch';
 import { MarketMood } from './MarketMood';
@@ -187,6 +188,7 @@ export const Header: React.FC = () => {
           )}
         </span>
         <MarketMood />
+        <SessionClock />
         <DeskFigures />
       </div>
 

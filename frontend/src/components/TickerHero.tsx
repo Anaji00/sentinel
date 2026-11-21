@@ -12,12 +12,19 @@ import useSWR from 'swr';
 import { useSearchParams } from 'next/navigation';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
-import { LABEL, rankWords, type Idea, type Recommendations } from '../lib/ideas';
+import { LABEL, forecastIsPlateau, rankWords, sharedForecastKeys, type Idea, type Recommendations } from '../lib/ideas';
 import { IdeaCard } from './IdeaCard';
 import { POLL } from './ui/DataProvider';
 import CandleChart from './CandleChart';
+import KeyFacts from './KeyFacts';
+import StockRecord from './StockRecord';
+import PriceAlerts from './PriceAlerts';
 import { barLabel } from '../lib/candles';
-import { headlinePrice } from '../lib/heroPrice';
+import { quoteCaption } from '../lib/liveFigures';
+import { okData } from '../lib/evidence';
+import { useEvidence } from '../lib/useEvidence';
+import { SCORES_STALE_DAYS, headlinePrice, scoreAgeDays } from '../lib/heroPrice';
+import { marketSession } from '../lib/marketSession';
 import { IconFollow } from './ui/icons';
 import { toggleTicker, usePreferences } from '../lib/preferences';
 
@@ -29,6 +36,8 @@ interface TickerModel {
   entry: { percentile: number; quintile: number } | null;
   validated: boolean;
   horizon_days: number | null;
+  /** The date the model's scores were written. */
+  as_of?: string | null;
 }
 
 interface BoardRow {
@@ -84,6 +93,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
       refreshInterval: POLL.slow,
     },
   );
+  const evidence = useEvidence(t || null);
   const model = useSWR<TickerModel>(
     t ? `/predictions/model/${encodeURIComponent(t)}` : null,
     fetcher,
@@ -98,6 +108,18 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
     refreshInterval: POLL.standard,
   });
   const { prefs, save } = usePreferences();
+  // The clock is read after mount and ticked each minute, so the server render and the first paint agree.
+  const [session, setSession] = React.useState<string>('');
+  const [nowMs, setNowMs] = React.useState(0);
+  React.useEffect(() => {
+    const tick = () => {
+      setSession(marketSession(new Date()).label);
+      setNowMs(Date.now());
+    };
+    tick();
+    const id = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
   const following = Boolean(prefs?.tickers.includes(t));
   if (!t) return null;
 
@@ -108,19 +130,23 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
   const call = ideaFor(recs.data, t);
   // The price and its change are worked out from the same daily closes the chart draws, so the header and the last
   // candle cannot disagree. A newer trade, when there is one, is shown as that and measured from the last close.
-  const price = headlinePrice(closes, call?.idea.price ?? null);
-  const last = price?.price ?? null;
-  const change = price?.changePct ?? null;
+  const fallback = headlinePrice(closes, call?.idea.price ?? null);
+  const quote = okData(evidence.data?.sections.quote);
+  const fromQuote = quote && quote.price != null;
+  const last = fromQuote ? quote.price : (fallback?.price ?? null);
+  const change = fromQuote ? quote.change_pct : (fallback?.changePct ?? null);
   const closeLabel = lastDay ? barLabel(`${lastDay}T00:00:00Z`, '1d') : null;
   const quarter = closes.length > 1 ? (closes[closes.length - 1] / closes[0] - 1) * 100 : null;
   const row = board.data?.board.find((r) => r.ticker === t);
   const e = model.data?.entry;
+  const scoreAge = scoreAgeDays(model.data?.as_of, nowMs);
+  const scoresStale = scoreAge != null && scoreAge >= SCORES_STALE_DAYS;
 
   return (
     // A container query, not a window breakpoint: the same header shows full
     // width on /ticker and in the 560px stock drawer.
     <div className="@container space-y-3">
-    <section className="grid gap-4 rounded-md border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1.3fr_1fr_1.2fr]">
+    <section className="rounded-md border border-line bg-raised p-4 sm:p-5">
       <div className="space-y-2 min-w-0">
         <div className="flex items-baseline gap-2">
           <h2 className="font-mono text-lead font-semibold text-ink">{t}</h2>
@@ -139,7 +165,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
             </button>
           )}
         </div>
-        <div className="flex items-baseline gap-3">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <span className="font-mono text-display font-semibold leading-none text-ink">
             {last != null ? `$${formatNumber(last, { decimals: 2 })}` : ABSENT}
           </span>
@@ -151,14 +177,19 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
               {formatNumber(change, { decimals: 2 })}%
             </span>
           )}
-          {price && (
-            <span className="text-micro text-ink-mute">
-              {price.kind === 'trade' ? `latest trade, from the ${closeLabel ?? 'last'} close` : `close ${closeLabel ?? ''}`.trim()}
+          {(fromQuote || fallback) && (
+            <span className="min-w-0 basis-full text-micro text-ink-mute @md:basis-auto">
+              {fromQuote
+                ? quoteCaption(quote, quote.change_base_date ? barLabel(`${quote.change_base_date}T00:00:00Z`, '1d') : null)
+                : fallback?.kind === 'trade'
+                  ? `latest trade, from the ${closeLabel ?? 'last'} close`
+                  : `close ${closeLabel ?? ''}`.trim()}
+              {!fromQuote && session ? ` · ${session}` : ''}
             </span>
           )}
         </div>
         <p className="text-micro text-ink-mute">
-          Last {closes.length || ABSENT} sessions
+          Last 3 months
           {quarter != null && (
             <>
               {' '}
@@ -171,7 +202,12 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
           )}
         </p>
       </div>
-
+    </section>
+    <CandleChart ticker={t} />
+    <KeyFacts ticker={t} price={last} />
+    <StockRecord ticker={t} />
+    <PriceAlerts ticker={t} price={last} />
+    <section className="grid gap-4 rounded-md border border-line bg-raised p-4 sm:p-5 @3xl:grid-cols-[1fr_1.2fr]">
       <div className="space-y-4">
         <div className="space-y-2">
           <div className="flex items-baseline justify-between text-micro">
@@ -190,10 +226,17 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
                 {rankWords(e.percentile)} of stocks
               </div>
               <RankBar percentile={e.percentile} />
+              {model.data?.as_of && (
+                <p className={`text-micro ${scoresStale ? 'text-caution' : 'text-ink-mute'}`}>
+                  {scoresStale
+                    ? `Out of date: these scores are from ${barLabel(`${model.data.as_of.slice(0, 10)}T00:00:00Z`, '1d')}, ${scoreAge} days ago.`
+                    : `Scores from ${barLabel(`${model.data.as_of.slice(0, 10)}T00:00:00Z`, '1d')}.`}
+                </p>
+              )}
             </>
           ) : (
             <p className="text-xs text-ink-mute">
-              {model.data ? 'Not in the ranked universe yet.' : 'Reading…'}
+              {model.data ? 'Not ranked: the model only ranks stocks with enough price history and trading volume.' : 'Loading the model view'}
             </p>
           )}
         </div>
@@ -224,6 +267,7 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
             days={call.days}
             validated={call.validated}
             horizonLabel={LABEL[call.horizon]?.split(' (')[0] ?? call.horizon}
+            plateau={forecastIsPlateau(call.idea, sharedForecastKeys(recs.data?.horizons?.[call.horizon]?.ideas))}
           />
         ) : (
           <div className="flex h-full flex-col justify-center gap-2 rounded-md border border-dashed border-line p-4">
@@ -239,7 +283,6 @@ export function TickerHero({ symbol }: { symbol?: string } = {}) {
         )}
       </div>
     </section>
-    <CandleChart ticker={t} />
     </div>
   );
 }

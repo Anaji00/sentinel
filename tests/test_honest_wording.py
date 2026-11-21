@@ -34,7 +34,9 @@ def test_track_record_leads_with_chance_and_withholds_rates_on_few_calls() -> No
     assert "MIN_GRADED = 20" in words and "too few to grade" in words
     page = _read("components/TrackRecord.tsx")
     assert page.count("tooFewToGrade(") >= 4 and page.count("HIT_RATE_CAUTION") >= 2
-    assert "no forecasting agent had beaten chance" in page
+    # Updated on purpose (18 Nov): the lead line used to be a fixed sentence dated 30 Oct, which went stale. It is now worked out from
+    # the clustered, beta-adjusted agent grades, with a fallback that still says no agent has been shown to beat chance.
+    assert "agentHeadline(" in page and "shown to beat chance" in page
 
 
 def test_flow_wording_still_says_late_and_incomplete_and_keeps_unknown_beside_known() -> None:

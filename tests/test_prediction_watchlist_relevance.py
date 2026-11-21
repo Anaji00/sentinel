@@ -154,3 +154,31 @@ def test_a_football_total_titled_china_is_still_off_domain():
     assert not is_relevant_market({"slug": "chi2-fos-nip-2026-10-31-team-total-away-2pt5", "title": "China Super League"})
     assert not is_relevant_market({"slug": "kor1-uls-pha-2026-11-01-total-2pt5", "question": "Korea: total goals"})
     assert is_relevant_market({"slug": "will-china-invade-taiwan-in-2026", "question": "Will China invade Taiwan?"})
+
+
+def test_the_cap_keeps_liquid_markets_before_quiet_ones():
+    """The sweep's volume order was thrown away by sorted(), so 15 active markets and 45 arbitrary quiet ones were polled (13 Nov 2026)."""
+    from shared.utils.prediction_markets import order_watch_list
+    stored = ["quiet-a", "quiet-b", "hot-3", "hot-1", "hot-2", "gone"]
+    assert order_watch_list(["hot-1", "hot-2", "hot-3", "not-stored"], stored, 4) == ["hot-1", "hot-2", "hot-3", "gone"]
+    assert order_watch_list([], ["b", "a"], 5) == ["a", "b"] and order_watch_list(["x", "x"], ["x"], 5) == ["x"]
+
+
+def test_a_market_returned_for_another_slug_is_not_labelled_with_the_queried_one():
+    """Gamma's /markets ignores event_slug and returns its default markets: a bitcoin slug was logged beside a Harris-nomination question."""
+    from shared.utils.prediction_markets import belongs_to_slug
+    market = {"slug": "will-harris-win-the-2028-nomination", "question": "Harris?"}
+    assert belongs_to_slug(market, {}, "bitcoin-above-74600") is False
+    assert belongs_to_slug(market, {"slug": "bitcoin-above-74600"}, "bitcoin-above-74600") is True      # a market inside the queried event
+    assert belongs_to_slug({"slug": "bitcoin-above-74600"}, None, "bitcoin-above-74600") is True
+    assert belongs_to_slug("not a dict", None, "x") is False
+
+
+def test_the_collector_queries_by_slug_not_event_slug():
+    assert "?slug={slug}" in COLLECTOR and "?event_slug={slug}" not in COLLECTOR
+
+
+def test_a_failed_events_lookup_never_marks_a_slug_dead():
+    """An outage on /events returned an empty list too and srem'd every slug it touched (found in review, 13 Nov 2026)."""
+    assert "events_answered = ev.status == 200" in COLLECTOR
+    assert "if events_answered and isinstance(data, list) and not data:" in COLLECTOR

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { barAt, barLabel, barRange, cleanBars, isUp, movingAverage, summarize } from '../lib/candles';
+import { rangeRequest, splitWarmup, barAt, barLabel, barRange, barTick, cleanBars, isUp, movingAverage, priceAtY, spanDays, summarize } from '../lib/candles';
 
 const bar = (ts: string, o: number, h: number, l: number, c: number, v = 100) => ({ ts, open: o, high: h, low: l, close: c, volume: v });
 
@@ -68,5 +68,39 @@ describe('pointer and labels', () => {
   it('labels day bars by date and intraday bars with the New York time', () => {
     expect(barLabel('2026-11-10T00:00:00Z', '1d')).toBe('Nov 10');
     expect(barLabel('2026-11-10T15:00:00Z', '1h')).toMatch(/Nov 10, 10:00 AM New York time/);
+  });
+});
+
+describe('axis helpers', () => {
+  it('labels ticks short', () => {
+    expect(barTick('2026-11-10T00:00:00Z', '1d')).toBe('Nov 10');
+    expect(barTick('2026-11-10T15:00:00Z', '1h')).toBe('Nov 10 10:00 AM');
+  });
+  it('counts the days a window covers', () => {
+    expect(spanDays([bar('2026-11-01T00:00:00Z', 1, 1, 1, 1), bar('2026-11-04T00:00:00Z', 1, 1, 1, 1)])).toBe(3);
+    expect(spanDays([])).toBe(0);
+  });
+  it('turns a height into a price, and nothing outside the plot', () => {
+    expect(priceAtY(0, 100, 10, 20)).toBe(20);
+    expect(priceAtY(100, 100, 10, 20)).toBe(10);
+    expect(priceAtY(50, 100, 10, 20)).toBe(15);
+    expect(priceAtY(150, 100, 10, 20)).toBeNull();
+  });
+});
+
+describe('ranges and warm-up', () => {
+  it('asks for the year to draw three months of daily bars', () => {
+    expect(rangeRequest('3M')).toEqual({ ask: '1Y', keep: 66 });
+    expect(rangeRequest('1M')).toEqual({ ask: '1M', keep: null });
+  });
+  it('splits warm-up bars off and trims the averages to match', () => {
+    const all = [{ ...bar('a', 1, 1, 1, 1), warmup: true }, { ...bar('b', 1, 1, 1, 1), warmup: true }, bar('c', 1, 1, 1, 1), bar('d', 1, 1, 1, 1)];
+    const out = splitWarmup(all, [[1, 2, 3, 4]]);
+    expect(out.bars.map((b) => b.ts)).toEqual(['c', 'd']);
+    expect(out.averages[0]).toEqual([3, 4]);
+  });
+  it('keeps everything when there is no warm-up', () => {
+    const all = [bar('a', 1, 1, 1, 1), bar('b', 1, 1, 1, 1)];
+    expect(splitWarmup(all, [[1, 2]]).bars).toHaveLength(2);
   });
 });

@@ -10,7 +10,7 @@ import Link from 'next/link';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
-import { LABEL, pickTopCalls, type Recommendations } from '../lib/ideas';
+import { LABEL, forecastIsPlateau, pickTopCalls, sharedForecastKeys, type Recommendations } from '../lib/ideas';
 import { IdeaCard } from './IdeaCard';
 import { POLL } from './ui/DataProvider';
 import { Updated } from './ui/Updated';
@@ -104,6 +104,7 @@ export function TopCalls({ count = 4 }: { count?: number }) {
               validated={c.validated}
               horizonLabel={LABEL[c.horizon]?.split(' (')[0] ?? c.horizon}
               compact
+              plateau={forecastIsPlateau(c.idea, sharedForecastKeys(data?.horizons?.[c.horizon]?.ideas))}
             />
           ))}
         </div>

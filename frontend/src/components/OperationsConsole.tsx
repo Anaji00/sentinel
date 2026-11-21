@@ -22,6 +22,7 @@
  * finding; so is a merge list with no candidates. Neither is a blank box.
  */
 
+import { plainTopic } from '../lib/plainEvent';
 import React, { useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import { fetcher } from '../lib/api';
@@ -296,7 +297,7 @@ export default function OperationsConsole() {
                 <EmptyState
                   kind="empty"
                   title="No failed events"
-                  detail="The good state, and worth telling apart from an unreachable table."
+                  detail="Nothing is stuck."
                 />
               ) : (
                 <>
@@ -317,7 +318,9 @@ export default function OperationsConsole() {
                               openTopic === t.topic ? '' : '-rotate-90'
                             }`}
                           />
-                          <span className="truncate">{t.topic}</span>
+                          <span className="truncate" title={t.topic}>
+                            {plainTopic(t.topic)}
+                          </span>
                         </button>
                         <span
                           className={`text-micro tabular-nums font-bold ${
@@ -347,7 +350,7 @@ export default function OperationsConsole() {
                             }
                             className="text-micro uppercase tracking-wide px-2 py-0.5 rounded border border-caution/30 text-caution hover:bg-caution/10 disabled:opacity-40"
                           >
-                            Replay
+                            Try again
                           </button>
                         )}
                       </div>
@@ -617,7 +620,7 @@ export default function OperationsConsole() {
                 <EmptyState
                   kind="empty"
                   title="No verdicts yet"
-                  detail="needs_review is computed from the balance of them, so it stays false until a rule has enough feedback to judge — which is not the same as a rule judged well."
+                  detail="A rule is only flagged for review once it has enough feedback to judge. Until then, no flag does not mean the rule is good."
                 />
               ) : (
                 <>

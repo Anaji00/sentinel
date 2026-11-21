@@ -256,6 +256,7 @@ async def poll_feed(
             # We log debug only to avoid spamming logs with transient errors.
             if resp.status != 200:
                 dropped("collector_news.feed", f"http_{resp.status}", logger, detail=feed_name)
+                _collector_metrics("collector-news").upstream_error(feed_name)
                 return 0
 
             content = await resp.text(errors='ignore')
@@ -271,6 +272,7 @@ async def poll_feed(
 
             title = str(entry.get("title", "")).strip()
             if not title:
+                _collector_metrics("collector-news").rejected("entry_no_title")
                 continue
 
             summary = str(entry.get("summary", ""))
@@ -309,6 +311,11 @@ async def poll_feed(
 
     except asyncio.TimeoutError:
         logger.debug(f"{feed_name}: Request timed out")
+    except (aiohttp.ClientError, OSError) as e:
+        # A feed host that does not resolve or refuses the connection: one line and the counter, not a traceback per failed poll (6,577 traceback lines
+        # in a day, 2,612 of them "Name or service not known").
+        logger.warning(f"{feed_name}: unreachable ({type(e).__name__}: {e})")
+        _collector_metrics("collector-news").upstream_error(feed_name)
     except Exception as e:
         # Broad Exception Catch:
         # In a long-running collector loop, we never want one malformed feed to crash

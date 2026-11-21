@@ -56,6 +56,9 @@ export interface Idea {
   /** The live price and its move since the last completed close (%). */
   price?: number | null;
   change_pct?: number | null;
+  /** The close that move is measured from, and its date; null when there is no earlier close. */
+  change_pct_base?: number | null;
+  change_pct_base_date?: string | null;
   /** This stock's own forecast (shared/utils/expected_returns.py). */
   forecast?: {
     expected_excess_bps: number | null;
@@ -71,6 +74,10 @@ export interface Idea {
     /** Today's company news read (trial M), bps over a week against other news names. */
     news_bps?: number | null;
     target: number | null;
+    /** True when the stock sits on a flat stretch of the measured calibration map, so its expected move says nothing about it. */
+    calibration_flat?: boolean | null;
+    /** The model's score before calibration. A score for ordering, not an expected return. */
+    raw_alpha_bps?: number | null;
   } | null;
   /** Event-led ideas: the insider, block-trade and filing evidence behind them. */
   evidence?: string[];
@@ -341,6 +348,32 @@ export function rightWayOdds(i: Idea): number | null {
 export function expectedMove(i: Idea, fallbackBps: number | null = null): number | null {
   const bps = i.forecast?.expected_excess_bps ?? fallbackBps;
   return bps == null ? null : bps / 100;
+}
+
+/** How many ideas in one list must share an exact expected move before it counts as a plateau, not a forecast. */
+export const PLATEAU_MIN = 3;
+
+const bpsKey = (v: number): number => Math.round(v * 10) / 10;
+
+/** Expected moves (in tenths of a basis point) that three or more ideas in the list share exactly. */
+export function sharedForecastKeys(ideas: readonly Idea[] | undefined): Set<number> {
+  const counts = new Map<number, number>();
+  for (const i of ideas ?? []) {
+    const v = i.forecast?.expected_excess_bps;
+    if (v != null && Number.isFinite(v)) counts.set(bpsKey(v), (counts.get(bpsKey(v)) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n >= PLATEAU_MIN).map(([k]) => k));
+}
+
+/**
+ * True when an idea's expected move is not a forecast for that stock: the backend says so (`calibration_flat`), or three
+ * or more ideas in the list share the exact same value. The tie counts even when the flag says false: on 20 Nov the
+ * top three monthly ideas all read 86.2 basis points with different raw scores and the flag false, which is a plateau.
+ */
+export function forecastIsPlateau(i: Idea, shared: ReadonlySet<number>): boolean {
+  if (i.forecast?.calibration_flat === true) return true;
+  const v = i.forecast?.expected_excess_bps;
+  return v != null && Number.isFinite(v) && shared.has(bpsKey(v));
 }
 
 export interface RankedCall {

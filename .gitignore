@@ -44,3 +44,6 @@ graph_merge_backup*.jsonl
 
 # Local data backups taken before destructive maintenance
 backups/
+
+# container logs saved by scripts/redeploy.sh
+logs/archive/

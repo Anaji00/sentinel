@@ -21,7 +21,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_client
 from shared.utils.agent_conclusions import PREDICTIONS_KEY_PATTERN
@@ -32,7 +32,7 @@ from shared.utils.rbac import Role, require_role
 from shared.utils.signal_plain import stand_out
 from shared.utils.options_positioning import positioning_key
 from shared.utils.signal_store import (
-    FACTOR_REPORT_KEY, FACTOR_SCORES_KEY, PRODUCER_GRADES_KEY, RECOMMENDATIONS_KEY, factor_scores_key,
+    FACTOR_REPORT_KEY, FACTOR_SCORES_KEY, PRODUCER_GRADES_KEY, PRODUCER_GRADES_V2_KEY, RECOMMENDATIONS_KEY, factor_scores_key,
 )
 
 logger = logging.getLogger("api.predictions")
@@ -459,6 +459,56 @@ async def track_record(
     return out
 
 
+_SLICE_SQL = """
+    SELECT idea_day, net_excess, exit_reason FROM paper_trades
+    WHERE status = 'closed' AND horizon = $1 AND ($2::int IS NULL OR direction = $2) AND ($3::text IS NULL OR ticker = $3)
+"""
+_SLICE_OPEN_SQL = """
+    SELECT p.idea_day, p.direction, p.entry_price, p.spy_entry, p.cost_bps, b.close, s.close AS spy_close
+    FROM paper_trades p
+    LEFT JOIN LATERAL (SELECT close FROM daily_bars WHERE ticker = p.ticker ORDER BY day DESC LIMIT 1) b ON true
+    LEFT JOIN LATERAL (SELECT close FROM daily_bars WHERE ticker = 'SPY' ORDER BY day DESC LIMIT 1) s ON true
+    WHERE p.status = 'open' AND p.horizon = $1 AND ($2::int IS NULL OR p.direction = $2) AND ($3::text IS NULL OR p.ticker = $3)
+"""
+
+
+@router.get("/track-record/slice")
+async def track_record_slice(
+    horizon: str = Query("monthly", pattern="^(daily|weekly|monthly)$"),
+    direction: Optional[str] = Query(None, pattern="^(long|short)$"),
+    ticker: Optional[str] = Query(None, pattern="^[A-Za-z.]{1,8}$", description="Only past ideas on this stock."),
+    db=Depends(get_db_optional),
+    redis_client=Depends(get_redis_client),
+    user: Dict[str, Any] = Depends(require_role(Role.VIEWER)),
+) -> Dict[str, Any]:
+    """One horizon's paper trades, closed plus open marked at the latest close, beside the walk-forward back-test: number of calls, share
+    right, mean and median net result after costs (bps, net of SPY), the ledger's start date, `stopped` (closed by their stop) and
+    `outcome_spread` (p10, p50, p90 in bps; null under 5 outcomes). `n_dates`, `first_date` and `last_date` say how many separate days the
+    calls span (many calls on few dates are one stretch, not many observations). With `ticker`, only past ideas on that stock (the
+    back-test stays the model's). Show `live.n` and `live.since` with any rate: the ledger is young. Missing figures are null, never 0."""
+    from shared.utils.paper_ledger import open_mark
+    from shared.utils.track_slice import slice_summary
+
+    rows: List[Dict[str, Any]] = []
+    marked: List[Dict[str, Any]] = []
+    if db is not None:
+        side = None if direction is None else (1 if direction == "long" else -1)
+        sym = ticker.upper() if ticker else None
+        try:
+            rows = await db.query(_SLICE_SQL, horizon, side, sym) or []
+            for r in await db.query(_SLICE_OPEN_SQL, horizon, side, sym) or []:
+                marked.append({"idea_day": r["idea_day"], "net_excess": open_mark(
+                    r["direction"], r["entry_price"], r["spy_entry"], r["close"], r["spy_close"], r["cost_bps"])})
+        except Exception as e:
+            swallowed("api_gateway.predictions.track_record_slice", e, logger)
+            # Not a 200 with zero calls: an unread ledger is not an empty one.
+            raise HTTPException(status_code=503, detail="The paper ledger could not be read just now.")
+    raw = getattr(redis_client, "raw", redis_client)
+    report = _load_json(await raw.get(FACTOR_REPORT_KEY)) if raw is not None else None
+    return {"horizon": horizon, "direction": direction, "ticker": ticker.upper() if ticker else None,
+            **slice_summary(rows, marked, report, horizon)}
+
+
 _PAPER_SQL = """
     SELECT idea_day, horizon, ticker, direction, model, status, entry_day, entry_price, cost_bps, adv_usd,
            exit_day, exit_price, exit_reason, gross_excess, net_excess, pnl_usd, notional_usd, scale, pnl_scaled_usd
@@ -698,8 +748,11 @@ async def producer_grades(
     (shared/utils/producer_grades.py, refreshed daily by the grader): whether a
     rule's stocks then moved more than usual, and whether a claim beat its placebo."""
     raw = getattr(redis_client, "raw", redis_client)
-    return _load_json(await raw.get(PRODUCER_GRADES_KEY)) or {
-        "note": "Graded daily once the grader has run."}
+    out = _load_json(await raw.get(PRODUCER_GRADES_KEY)) or {"note": "Graded daily once the grader has run."}
+    # Additive: the same families with one unit per (family, ticker, date), a same-day random-stock control and a t over dates (services/agents/grades_v2_job.py).
+    # The stored t values above treat every alert as independent and are far too large; use `clustered` to judge a family.
+    out["clustered"] = _load_json(await raw.get(PRODUCER_GRADES_V2_KEY))
+    return out
 
 
 _IC_SQL = "SELECT as_of, horizon, ic, n, end_day FROM factor_ic WHERE as_of > CURRENT_DATE - 400 ORDER BY as_of"

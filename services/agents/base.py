@@ -139,7 +139,7 @@ from shared.utils.quote_cache import quote_key
 # The same set the correlation layer refuses to treat as corroboration. One
 # definition of "this is a position report, not a claim", used by both.
 from shared.models.events import POSITION_TELEMETRY_TYPES as ROUTINE_TELEMETRY_TYPES
-from shared.utils.heartbeat import touch_heartbeat
+from shared.utils.heartbeat import stall_seconds, touch_heartbeat
 from shared.utils.text import clip
 from shared.utils.untrusted_text import quote_untrusted_block, sanitize_untrusted
 from shared.utils.ollama import (
@@ -786,6 +786,7 @@ class SentinelAgent(PredictionScoringMixin, ABC):
         self.logger = logging.getLogger(f"agent.{agent_name}")
         self._processed = 0
         self._errors = 0
+        self._dispatch_started: Dict[int, float] = {}          # dispatch token -> monotonic start, for the heartbeat's hung-handler check
         self._started_at = datetime.now(timezone.utc)
         
         # Declared here for IDE support; instantiated inside the async event loop in run().
@@ -961,9 +962,10 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                         try:
                             payload = json.loads(msg.value.decode('utf-8'))
                             tasks.append((safe_create_task(self._dispatch(payload)), msg))
-                        except json.JSONDecodeError as e:
+                        except (ValueError, AttributeError) as e:
+                            # JSONDecodeError and UnicodeDecodeError are ValueErrors; a null value is an AttributeError (review L2).
                             self.logger.error(f"POISON PILL dropped: {e}")
-                            await self._send_dlq({"raw": encode_dlq_payload(msg.value)}, "JSONDecodeError", self.input_topics[0])
+                            await self._send_dlq({"raw": encode_dlq_payload(msg.value)}, type(e).__name__, self.input_topics[0])
 
                     # Reading is decoupled from thinking. Awaiting the batch here
                     # meant one slow inference froze the loop: a single measured
@@ -1162,6 +1164,8 @@ class SentinelAgent(PredictionScoringMixin, ABC):
 
         async with self._dispatch_semaphore:
             t0 = time.monotonic()
+            token = id(raw) ^ int(t0 * 1e6)
+            self._dispatch_started[token] = t0
             try:
                 result = await self.handle(raw)
                 if result is not None:
@@ -1271,6 +1275,8 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                 self.logger.error(f"Transient or unhandled dispatch error: {e}", exc_info=True)
                 # Re-raise to crash the batch, skip commit, and preserve At-Least-Once delivery
                 raise
+            finally:
+                self._dispatch_started.pop(token, None)
 
     async def capacity_or_defer(
         self, message: Dict[str, Any], score: Optional[float] = None
@@ -1406,7 +1412,16 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                 stalled_since = stalled_since or last_sample_at
             else:
                 stalled_since = None
-            stalled_seconds = (now - stalled_since).total_seconds() if stalled_since else 0.0
+            idle_seconds = (now - stalled_since).total_seconds() if stalled_since else 0.0
+            # No input is not a stall: a sparse subscription is idle for hours with nothing unread (572 STALLED lines up to 2,368 s while the
+            # blocked-loop sampler found two reports under 1.5 s). A stall needs unread messages, read from the consumer's own lag.
+            try:
+                lag_report = await self._consumer.lag_report()
+            except Exception as exc:
+                swallowed(f"agents.{self.name}.lag_report", exc, self.logger)
+                lag_report = {}
+            oldest_dispatch = (time.monotonic() - min(self._dispatch_started.values())) if self._dispatch_started else 0.0
+            stalled_seconds = stall_seconds(idle_seconds, lag_report.get("lag"), oldest_dispatch)
 
             stall_note = f" STALLED {int(stalled_seconds)}s" if stalled_seconds >= HEARTBEAT_INTERVAL else ""
 
@@ -1459,7 +1474,6 @@ class SentinelAgent(PredictionScoringMixin, ABC):
                 # retention rather than by consumption, so a consumer that falls
                 # far enough behind sees its own backlog deleted and its lag
                 # *drop*, which reads as recovery.
-                lag_report = await self._consumer.lag_report()
                 current_lag = lag_report.get("lag")
                 lag_growing = None
                 if isinstance(current_lag, int) and isinstance(previous_lag, int):

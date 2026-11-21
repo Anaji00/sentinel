@@ -200,7 +200,9 @@ services:
     # the classic way a cgroup-limited container still gets OOM-killed.
     command: >
       postgres
-      -c shared_preload_libraries=timescaledb
+      -c shared_preload_libraries=timescaledb,pg_stat_statements
+      -c pg_stat_statements.track=top
+      -c pg_stat_statements.max=2000
       -c max_connections=60
       -c shared_buffers=512MB
       -c effective_cache_size=1200MB
@@ -317,10 +319,11 @@ services:
     # never silently dropped; if memory is exhausted with nothing volatile
     # left, writes fail loudly instead, which is a failure that can be seen.
     #
-    # The 512mb cap is left alone deliberately: the observed peak is 45% over
+    # 13 Nov 2026: raised from 400mb to 640mb (82% full, 64 evictions of TTL keys), inside the 1G container limit, which leaves room for an
+    # AOF rewrite. An earlier note on this block: the 512mb cap is left alone deliberately: the observed peak is 45% over
     # it, so raising it is a host-memory decision rather than a config tidy.
     command: >
-      redis-server --appendonly yes --save "" --maxmemory 400mb --maxmemory-policy volatile-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      redis-server --appendonly yes --save "" --maxmemory 640mb --maxmemory-policy volatile-lru --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     volumes:
       - redis_data:/data
     deploy:
@@ -469,7 +472,9 @@ services:
           # The headroom is real rather than borrowed: the whole stack occupies
           # 5.3 GiB of a 25.44 GiB VM, so these limits are ceilings that guard
           # against a simultaneous peak the deployment has never approached.
-          memory: 2.0G
+          #
+          # 13 Nov 2026: 2.0G -> 2.5G. It sat at 1.83G (92%) before its 18:19 restart; the host has 25 GiB and the stack uses about 14.
+          memory: 2.5G
     depends_on:
       kafka:
         condition: service_healthy
@@ -813,7 +818,8 @@ services:
           # the constrained resource on this host; memory is, and this costs
           # none of it.
           cpus: '2.0'
-          memory: 1G
+          # 1G -> 1.5G on 13 Nov 2026: 846 MiB resident (83%) on 505k points; the host has headroom.
+          memory: 1.5G
     healthcheck:
       disable: true
 

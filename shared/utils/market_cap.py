@@ -30,7 +30,9 @@ board is sparse until the backfill has run; the alternative is a board that
 makes a claim it cannot support.
 """
 
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, Optional, Set, Tuple
+
+from shared.utils.quiet_failures import dropped as count_dropped
 
 # A week. Market capitalisation moves with the share price, so this is
 # deliberately stale-tolerant: the gate asks "is this a billion-dollar company",
@@ -171,11 +173,38 @@ CAPS_KEY = "sentinel:marketcap:best"
 CAPS_TTL_SEC = 3 * 86400
 
 
+# A computed cap more than this many times the vendor's is a share count that does not match the traded unit (ordinary shares against
+# ADS, or a count from before a reverse split), not a company that large: AKTX read $596bn against the vendor's $13m (13 Nov 2026; 54
+# of the 1,942 names with both figures were over 5x, three of them past the $10bn gate).
+IMPLAUSIBLE_RATIO = 5.0
+
+
 def best_cap(computed: Optional[float], cached: Optional[float]) -> Optional[float]:
     """The larger of the two estimates: one share class or a stale count can make
-    the computed figure too small, rarely too large."""
+    the computed figure too small, rarely too large. When it is far larger than
+    the vendor's figure, the vendor's is used."""
+    if computed and cached and computed > 0 and cached > 0 and computed > IMPLAUSIBLE_RATIO * cached:
+        return cached
     vals = [v for v in (computed, cached) if v is not None and v > 0]
     return max(vals) if vals else None
+
+
+# Foreign ADRs whose computed cap (SEC ordinary share count times the ADS price) is overstated by the number of ordinary shares one ADS stands for, and
+# one whose vendor figure is in the home currency in a field read as USD (layer audit 18 Nov, finding 11): TSM read $9,404bn (true about $1.9tn), NGG about 6x,
+# E about 3x, SHEL 2.6x (under the 5x vendor guard), EQNR $946bn (a NOK figure; about $90bn). Curated and small; an ADR not listed is unchanged.
+ADS_ORDINARY_SHARES: Dict[str, float] = {"TSM": 5.0, "NGG": 5.0, "E": 2.0, "SHEL": 2.0}
+VENDOR_FIGURE_NOT_USD = frozenset({"EQNR"})
+
+
+def adr_adjusted(ticker: str, computed: Optional[float], cached: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """(computed, cached) corrected for a known ADR: the computed cap divided by its ordinary shares per ADS; a vendor figure known to be in another currency dropped."""
+    t = str(ticker).upper()
+    ratio = ADS_ORDINARY_SHARES.get(t)
+    if ratio and computed:
+        computed = computed / ratio
+    if t in VENDOR_FIGURE_NOT_USD:
+        cached = None
+    return computed, cached
 
 
 async def large_caps(redis_client: Any, min_usd: float = DEFAULT_MIN_MARKET_CAP_USD) -> Optional[Set[str]]:
@@ -209,21 +238,39 @@ async def is_large_cap(redis_client: Any, ticker: str, min_usd: float = DEFAULT_
         return False
 
 
+# A company is not worth more than this many days of its own dollar trading volume: Apple is about 350, a thinly traded real company a few
+# thousand. LTM read $27 trillion (cap over 20-day volume: 549,000), BSAC $6 trillion, BCH $3.9 trillion and AMX $1.5 trillion (13 Nov 2026):
+# foreign ADRs whose SEC share count is ordinary shares, multiplied by the price of an ADS. Such a name is unknown, not large.
+# 21 Nov 2026 (owner-approved P5): 4,000, down from 10,000. Preferred shares and ADRs counted in ordinary shares slipped under the old bound
+# (AGNCZ 9,212, IMOS 5,558, WF 4,407, PAM 4,474); real names top out near 400 (Apple 297, Berkshire B 418). Only BRK.A of the 25 names above
+# 4,000 reaches the model and none is in the B1 book.
+MAX_CAP_OVER_ADV = 4_000.0
+
+
+def plausible_against_liquidity(cap: float, adv_usd: Optional[float]) -> bool:
+    """False when the cap is more than MAX_CAP_OVER_ADV times the stock's average daily dollar volume; unknown volume cannot disprove it."""
+    return adv_usd is None or adv_usd <= 0 or cap / adv_usd <= MAX_CAP_OVER_ADV
+
+
 def cap_rows(computed: Dict[str, float], cached: Dict[str, Optional[float]],
-             tickers: Iterable[str]) -> Dict[str, float]:
-    """{ticker: best cap} for every ticker with at least one estimate."""
+             tickers: Iterable[str], adv: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """{ticker: best cap} for every ticker with at least one estimate; a cap that fails the liquidity bound is left out (unknown)."""
     out = {}
     for t in tickers:
-        b = best_cap(computed.get(t), cached.get(t))
-        if b is not None:
+        b = best_cap(*adr_adjusted(t, computed.get(t), cached.get(t)))
+        if b is not None and (adv is None or plausible_against_liquidity(b, adv.get(t))):
             out[t] = b
+        elif b is not None:
+            # Left out as implausible; counted so a halted real company dropped on a data artefact is visible (review L10), not kept or invented.
+            count_dropped("market_cap.implausible_vs_liquidity", "cap over the liquidity bound; name left out of the cap table", detail=f"{t} cap {b:.0f}")
     return out
 
 
 __all__ = [
     "CAPS_KEY",
     "CAPS_TTL_SEC",
-    "best_cap",
+    "ADS_ORDINARY_SHARES", "VENDOR_FIGURE_NOT_USD", "adr_adjusted",
+    "best_cap", "plausible_against_liquidity", "MAX_CAP_OVER_ADV",
     "cap_rows",
     "is_large_cap",
     "large_caps",

@@ -20,7 +20,7 @@ Two capabilities the platform lacked, exposed where a person can act on them:
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from services.api_gateway.dependencies import get_db_optional, get_redis_optional
@@ -151,6 +151,7 @@ async def get_merge_candidates(
 @router.post("/entities/alias")
 async def post_alias(
     req: AliasRequest,
+    request: Request,
     redis=Depends(get_redis_optional),
     db=Depends(get_db_optional),
     user: Dict[str, Any] = Depends(require_role(Role.ANALYST)),
@@ -180,7 +181,7 @@ async def post_alias(
     # made it is what makes that traceable rather than inexplicable.
     ok = await record_alias(
         redis, req.alias, req.canonical,
-        source=f"human:{user.get('sub') or user.get('email') or 'unknown'}",
+        source=f"human:{getattr(request.state, 'identity', None) or 'unknown'}",
         confidence=1.0,
     )
     if not ok:

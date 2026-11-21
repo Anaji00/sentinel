@@ -7,6 +7,7 @@
  * exist elsewhere in the app, so nothing here shows a figure the rest of the app would not.
  */
 
+import { peerMove } from '../lib/peerMove';
 import React from 'react';
 import useSWR from 'swr';
 import { fetcher } from '../lib/api';
@@ -118,7 +119,19 @@ export default function Desk() {
                     >
                       <span className="font-mono text-sm font-semibold text-ink">{a.ticker}</span>
                       <span className="min-w-0">
-                        <span className="block truncate text-micro text-ink-dim">{(a.description ?? '').replace(/^\S+\s+/, '').split(/ while |: /)[0]}</span>
+                        {(() => {
+                          const mv = peerMove(a.description);
+                          return mv ? (
+                            <span className="flex items-baseline gap-1.5">
+                              <span className={`font-mono text-base font-semibold tabular-nums ${mv.pct < 0 ? 'text-negative' : 'text-positive'}`}>
+                                {mv.pct < 0 ? '▼' : '▲'} {Math.abs(mv.pct).toFixed(1)}%
+                              </span>
+                              <span className="truncate text-micro text-ink-dim">{mv.span}</span>
+                            </span>
+                          ) : (
+                            <span className="block truncate text-micro text-ink-dim">{(a.description ?? '').replace(/^\S+\s+/, '').split(/ while |: /)[0]}</span>
+                          );
+                        })()}
                         <span className="mt-0.5 flex items-center gap-2">
                           <ZWhisker z={a.situation?.last_z} />
                           <span className="font-mono text-micro tabular-nums text-ink-mute">{a.situation?.last_z != null ? `${a.situation.last_z > 0 ? '+' : ''}${a.situation.last_z.toFixed(2)}` : ''}</span>

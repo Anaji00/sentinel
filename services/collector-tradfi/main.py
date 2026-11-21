@@ -560,6 +560,7 @@ async def _fetch_form4_document(session, index_link: str):
                     detail=f"HTTP {resp.status}",
                     variant=f"index_{resp.status}",
                 )
+                _collector_metrics("collector-tradfi").upstream_error("sec_form4_index")
                 return None
             listing = await resp.json(content_type=None)
     except Exception as e:
@@ -574,6 +575,7 @@ async def _fetch_form4_document(session, index_link: str):
             detail=index_url,
             variant="no_xml",
         )
+        _collector_metrics("collector-tradfi").rejected("form4_no_xml")
         return None
 
     url = form4_document_url(index_link, name)
@@ -593,6 +595,7 @@ async def _fetch_form4_document(session, index_link: str):
                     detail=f"HTTP {resp.status}",
                     variant=str(resp.status),
                 )
+                _collector_metrics("collector-tradfi").upstream_error("sec_form4_document")
                 return None
             body = await resp.read()
     except Exception as e:
@@ -703,6 +706,7 @@ async def poll_form4(session: aiohttp.ClientSession, producer: SentinelProducer,
                     logger,
                     detail=parsed.get("issuer_name", "")[:80],
                 )
+                _collector_metrics("collector-tradfi").rejected("form4_unlisted_issuer")
                 continue
             if parsed:
                 payload.update({
@@ -2293,6 +2297,7 @@ async def poll_finnhub_earnings(producer: SentinelProducer, redis_client):
                             "earnings for a ticker the platform does not quote",
                             logger, variant=trade_type,
                         )
+                        _collector_metrics("collector-tradfi").rejected("earnings_unpriced")
                         continue
 
                     event = RawEvent(

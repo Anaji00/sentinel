@@ -67,4 +67,26 @@ def for_ticker(raw_entries: Iterable[Any], ticker: str, descriptions: Optional[M
     return out
 
 
-__all__ = ["WINDOW_WORDS", "entry_view", "explain_reason", "for_ticker"]
+def for_tickers(raw_entries: Iterable[Any], tickers: Iterable[str], descriptions: Optional[Mapping[str, str]] = None, limit: int = 20) -> Dict[str, List[Dict[str, Any]]]:
+    """for_ticker for several tickers in one pass: each entry is parsed once (the input is newest first) and the walk stops when every ticker has `limit`."""
+    wanted = {str(t).strip().upper() for t in tickers}
+    out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in wanted}
+    full = 0
+    for item in raw_entries:
+        try:
+            e = json.loads(item if isinstance(item, str) else item.decode("utf-8"))
+        except (ValueError, AttributeError):
+            continue
+        if not isinstance(e, dict):
+            continue
+        t = str(e.get("instrument") or "").upper()
+        if t in out and len(out[t]) < limit:
+            out[t].append(entry_view(e, descriptions))
+            if len(out[t]) == limit:
+                full += 1
+                if full == len(out):
+                    break
+    return out
+
+
+__all__ = ["WINDOW_WORDS", "entry_view", "explain_reason", "for_ticker", "for_tickers"]

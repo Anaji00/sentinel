@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { headlinePrice } from '../lib/heroPrice';
+import { headlinePrice, scoreAgeDays } from '../lib/heroPrice';
 
 describe('headlinePrice', () => {
   it('shows the last close with its change from the one before', () => {
@@ -25,5 +25,18 @@ describe('headlinePrice', () => {
   it('ignores a bad trade', () => {
     expect(headlinePrice([100], NaN)!.kind).toBe('close');
     expect(headlinePrice([100], -3)!.kind).toBe('close');
+  });
+});
+
+describe('scoreAgeDays', () => {
+  const now = Date.parse('2026-11-12T12:00:00Z');
+  it('counts whole days since the scores date', () => {
+    expect(scoreAgeDays('2026-11-06', now)).toBe(6);
+    expect(scoreAgeDays('2026-11-12T07:32:00Z', now)).toBe(0);
+  });
+  it('is null for a missing or unreadable date', () => {
+    expect(scoreAgeDays(null, now)).toBeNull();
+    expect(scoreAgeDays('soon', now)).toBeNull();
+    expect(scoreAgeDays('2026-11-06', 0)).toBeNull();
   });
 });

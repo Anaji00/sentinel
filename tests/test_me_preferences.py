@@ -66,3 +66,16 @@ def test_two_people_never_see_each_others_settings() -> None:
     # A row written as a JSON string by the first version still reads.
     db.rows["old@x.com"] = json.dumps({"tickers": ["AMD"]})
     assert asyncio.run(me.get_preferences(_req("session:old@x.com"), db=db))["tickers"] == ["AMD"]
+
+
+def test_last_seen_and_flags_are_stored_per_person_and_validated():
+    import pytest
+    from services.api_gateway.routes import me
+    p = me.merge({}, {"last_seen_at": "2026-11-12T09:30:00Z", "flags": {"welcomed_digest": True, "seen_alerts": False}})
+    assert p.last_seen_at == "2026-11-12T09:30:00+00:00" and p.flags == {"welcomed_digest": True, "seen_alerts": False}
+    assert me.merge({"last_seen_at": "2026-11-12T09:30:00+00:00"}, {"flags": {"a": True}}).last_seen_at == "2026-11-12T09:30:00+00:00"
+    assert me.merge({}, {"last_seen_at": ""}).last_seen_at is None
+    for bad in ({"last_seen_at": "yesterday"}, {"last_seen_at": "2099-01-01T00:00:00Z"}, {"flags": {"Bad Name": True}},
+                {"flags": {f"f{i}": True for i in range(31)}}):
+        with pytest.raises(ValueError):
+            me.merge({}, bad)

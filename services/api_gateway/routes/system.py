@@ -1,8 +1,8 @@
 import logging
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import Any, Dict
 
-from services.api_gateway.dependencies import get_redis_client, get_redis_optional
+from services.api_gateway.dependencies import get_db_optional, get_redis_client, get_redis_optional
 from shared.utils.rbac import Role, require_role
 from shared.utils.config import config
 
@@ -171,3 +171,55 @@ async def model_quota(
     models = await mq.snapshot(raw)
     return {"count": len(models), "models": models,
             "note": None if models else "No hosted-model limits are configured."}
+
+
+@router.get("/redis")
+async def redis_health(redis=Depends(get_redis_optional)):
+    """Redis memory against its limit and keys evicted in roughly the last 24 hours (shared/utils/redis_health.py). Any eviction in that window, or 85%
+    full, is listed in `alarms`, and the alarm clears by itself once a day passes without one. The baseline (eviction count at the window's start) is stored
+    with the Redis run id and its start time; the counter restarts with the process (a new run's baseline is 0), a read never moves it, and an unreadable
+    baseline is treated as unknown rather than as an error."""
+    import time
+
+    from shared.utils.redis_health import plan_baseline, summarize
+
+    raw = getattr(redis, "raw", redis)
+    if raw is None:
+        raise HTTPException(status_code=503, detail="Redis is not reachable.")
+    mem, stats, server = await raw.info("memory"), await raw.info("stats"), await raw.info("server")
+    run_id = str(server.get("run_id") or "")
+    evicted = int(stats.get("evicted_keys") or 0)
+    key = "sentinel:redis:evicted_baseline"
+    baseline, new_value = plan_baseline(await raw.get(key), run_id, int(time.time()), evicted)
+    if new_value is not None:
+        await raw.set(key, new_value)
+    return summarize(mem, stats, baseline)
+
+
+@router.get("/latency")
+async def route_latency(min_requests: int = 1, limit: int = 50):
+    """Per-route latency in this gateway process since it started: requests, mean, p50, p95, max, slow (over 1 s) and 5xx counts over each
+    route's last 500 requests, slowest p95 first. Keyed by route template, so no tickers or user data appear."""
+    from shared.utils.route_latency import BOOK, SLOW_MS, WINDOW
+
+    return {"slow_ms": SLOW_MS, "window": WINDOW, "routes": BOOK.table(min_count=max(1, min_requests), limit=max(1, min(limit, 200)))}
+
+
+@router.get("/correlation-funnel")
+async def correlation_funnel(days: int = 7, db=Depends(get_db_optional), redis=Depends(get_redis_optional)):
+    """What each correlation rule family produced in the last `days` (1 to 30): counts by alert tier, share of all correlations, rules and entities behind it
+    (shared/utils/correlation_funnel.py). The input to the registered question of which families only ever reach WATCH and could stop feeding agents. Report only."""
+    from shared.utils import correlation_funnel as cf
+    from shared.utils.response_cache import cached_json
+
+    if db is None:
+        raise HTTPException(status_code=503, detail="The funnel is temporarily unavailable.")
+    n = max(1, min(int(days), 30))
+    raw = getattr(redis, "raw", redis)
+
+    async def compute():
+        rows = await db.query("SELECT rule_name, alert_tier, count(*) AS n, count(DISTINCT primary_entity_id) AS entities FROM correlations "
+                              "WHERE detected_at > NOW() - make_interval(days => $1) GROUP BY 1, 2", n)
+        return {"days": n, **cf.build([dict(r) for r in rows or []])}
+
+    return await cached_json(raw, f"api:health:correlation_funnel:{n}", compute, ttl=600, max_stale=3600)

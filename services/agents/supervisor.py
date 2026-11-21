@@ -24,6 +24,7 @@ from shared.models.ontology import (
     is_valid_node_label,
     resolve_node_label,
 )
+from shared.utils.edge_proposals import default_source, refusal_reason
 from shared.utils.quiet_failures import dropped, swallowed
 
 logger = logging.getLogger("agent.supervisor")
@@ -489,6 +490,11 @@ class GraphSupervisor(SentinelAgent):
                             source=f"supervisor.batch.{action}",
                         )
 
+                        refused = refusal_reason(relation, entity_id, target_id)
+                        if refused:
+                            dropped("agents.supervisor.edge_refused", f"{relation} edge refused: {refused}", logger, detail=f"{entity_id} {target_id}")
+                            continue
+
                         rel_key = (source_label, relation, target_label)
                         if rel_key not in links_by_relation:
                             links_by_relation[rel_key] = []
@@ -497,7 +503,7 @@ class GraphSupervisor(SentinelAgent):
                         links_by_relation[rel_key].append({
                             "id": graph_node_id(entity_id, source_label),
                             "target_id": graph_node_id(target_id, target_label),
-                            "source": str(props.get("source") or data.get("source") or ""),
+                            "source": default_source(p),
                             "extra": _edge_extras(props),
                             "weight": _as_unit_interval(data.get("weight", props.get("weight", 1.0))),
                             "confidence": _as_unit_interval(

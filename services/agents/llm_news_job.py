@@ -122,8 +122,19 @@ class LlmNewsJob:
                     await self.db.execute(_INSERT_SQL, int(r["id"]), str(r["ticker"]).upper(), _ts(r["created_at"]),
                                           0, MODEL + ln.STALE_SUFFIX, self.cutoff, None)
             rows = [r for r in rows if r["id"] not in stale]
+        # Admission: a partial batch waits for more headlines (up to ln.MAX_WAIT_SECONDS) instead of costing a request for one or two.
+        if rows:
+            oldest = min(_ts(r["created_at"]) for r in rows)
+            oldest_age = (datetime.now(timezone.utc) - (oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc))).total_seconds()
+            if not ln.ready_to_send(len(rows), oldest_age):
+                return {"scored": 0, "requests": 0, "stale_skipped": len(stale), "waiting": len(rows)}
+        # Spaced to the model's tokens-a-minute bucket (Groq's 8,000 for gpt-oss-120b) instead of sent back to back.
+        quota = hosted_llm.parse_quotas(os.getenv("LLM_QUOTAS", "")).get(MODEL)
+        gap = ln.pace_seconds(quota.tpm if quota else 0)
         for k in range(0, len(rows), ln.BATCH):
             batch = rows[k:k + ln.BATCH]
+            if k and gap:
+                await asyncio.sleep(gap)
             try:
                 answer = await llm.infer(ln.SYSTEM, ln.prompt([(str(r["ticker"]), str(r["headline"])) for r in batch]),
                                          ln.Scores, temperature=0.0, model=MODEL, max_retries=1,

@@ -3,6 +3,7 @@ import json
 import math
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from shared.utils.candles import window_words, above_normal_words
@@ -21,6 +22,7 @@ from shared.models import (
     AnomalyBreakdown, MarketMicrostructure, ScoreAdjustment
 )
 from shared.utils import quant_calc
+from shared.utils import score_rescale
 from shared.utils.equities import asset_class, is_valid_primary_equity
 from shared.utils.quote_cache import QUOTE_CACHE_TTL_SEC, parse_quote, quote_key
 from shared.utils.market_session import instrument_closed_at, session_label_at
@@ -266,6 +268,8 @@ EARNINGS_LOOKAHEAD_DAYS = int(os.getenv("EARNINGS_LOOKAHEAD_DAYS", "7"))
 # reserved for events that earned it on the base score rather than on the
 # number of boxes they ticked.
 MAX_TOTAL_LIFT_SHARE = float(os.getenv("TRADFI_MAX_TOTAL_LIFT", "0.55"))
+
+ADV_CACHE_TTL_SEC = 3600.0
 
 
 # Shares per option contract. One contract is a hundred shares on every US
@@ -584,6 +588,7 @@ class TradFiEnricher:
         self.redis_client = redis_client
         self.graph = graph_writer
         self.db = db
+        self._adv_cache: dict = {}
         # Flags consulted by the macro-release path below.
         self.flags = FeatureFlagManager(redis_client)
 
@@ -974,6 +979,36 @@ class TradFiEnricher:
         final_events = await asyncio.gather(*results) if results else []
         return [e for e in final_events if e]
 
+    async def _adv_usd(self, ticker: str) -> Optional[float]:
+        """Mean daily dollar volume over the 20 sessions before today (daily_bars), cached for an hour; None when unknown."""
+        hit = self._adv_cache.get(ticker)
+        if hit is not None and time.monotonic() - hit[0] < ADV_CACHE_TTL_SEC:
+            return hit[1]
+        db_conn = self.db
+        if db_conn is None:
+            from shared.db import get_timescale
+            db_conn = await get_timescale()
+        rows = list(reversed(await db_conn.query(
+            "SELECT close, volume FROM daily_bars WHERE ticker = $1 AND day < CURRENT_DATE ORDER BY day DESC LIMIT 20", ticker) or []))
+        adv = score_rescale.adv_usd([float(r["close"]) for r in rows], [float(r["volume"] or 0.0) for r in rows])
+        self._adv_cache[ticker] = (time.monotonic(), adv)
+        return adv
+
+    async def _participation_rescore(self, ticker: str, notional: float, anomaly: float, adjustments: list) -> float:
+        """A block scored by its share of the name's normal daily dollar volume (registered 21 Nov, R3). Only under SCORE_CALIBRATION_V2
+        (default off); never raises the score, and an unreadable ADV leaves it as it was."""
+        if not score_rescale.v2_enabled():
+            return anomaly
+        try:
+            rescored = score_rescale.block_score(anomaly, notional, await self._adv_usd(ticker))
+        except Exception as exc:
+            swallowed("enrichment.tradfi.block_participation_v2", exc, logger, detail=ticker)
+            return anomaly
+        if rescored < anomaly:
+            adjustments.append(ScoreAdjustment(reason="block_participation_v2", delta=round(rescored - anomaly, 6)))
+            return rescored
+        return anomaly
+
     async def _finalize_equity_trade(self, raw, p, ticker, price, volume, notional, tags, direction_str, anomaly, hawkes_ratio=0.0, score_adjustments=None, earnings=None, gate_significant: bool = False, coverage_fraction: Optional[float] = None, coverage_basis: Optional[str] = None):
         if score_adjustments is None:
             score_adjustments = []
@@ -989,6 +1024,8 @@ class TradFiEnricher:
                 score_adjustments.append(ScoreAdjustment(reason="volume_capitulation_x1.4", delta=round(anomaly - pre_cap, 6)))
         except Exception as e:
             logger.debug(f"Baseline fetch failed: {e}")
+
+        anomaly = await self._participation_rescore(ticker, notional, anomaly, score_adjustments)
 
         await self._sync_geo_watchlist(ticker, tags)
         await self._update_volume_baseline(ticker, volume)

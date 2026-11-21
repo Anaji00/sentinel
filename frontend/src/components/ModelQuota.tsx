@@ -39,7 +39,7 @@ export default function ModelQuota() {
               </div>
               <p className="text-micro text-ink-dim">
                 {quotaLine(m)}
-                {m.share_of_limit_used != null && m.status !== 'no key set' && <> {formatNumber(m.share_of_limit_used * 100, { decimals: 0 })}% of its tightest limit used.</>}
+                {m.share_of_limit_used != null && m.status !== 'no key set' && <> {formatNumber(m.share_of_limit_used * 100, { decimals: 0 })}% of its strictest limit used.</>}
               </p>
             </li>
           ))}

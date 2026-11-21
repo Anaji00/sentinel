@@ -87,8 +87,14 @@ export default function AutoTradePanel() {
         Only the model&apos;s strongest calls, traded in a paper brokerage account: half the money in the stocks it ranks
         in its 90th to 99th percentile, half betting against its bottom tenth, equal amounts each, rebuilt every month
         and no index fund. Paper account only. The best estimate for this book is a Sharpe near 0.4 across eight test
-        calendars, with no edge beyond known factors shown. Real money would need the validation gate passed and 24 months
-        of forward record, so the account&apos;s gain or loss against the S&amp;P 500 is not evidence that it works.
+        calendars, with no edge beyond known factors shown.
+      </p>
+      <p role="note" className="text-micro text-ink-mute">
+        That 0.4 is an estimate from past data, not a result. It assumes a flat borrowing cost for the stocks bet against
+        (real fees were lower) and it includes some exposure to the stock market itself, so it is not proof of skill. The
+        live paper record is a forward test and is far too short to judge: confirming a Sharpe of 0.4 would take roughly 17
+        years of results. Real money would need the validation gate passed and 24 months of forward record, so the account&apos;s
+        gain or loss against the S&amp;P 500 is not evidence that it works.
       </p>
       {error ? (
         <p className="text-ink-mute">The auto-trader could not be read.</p>

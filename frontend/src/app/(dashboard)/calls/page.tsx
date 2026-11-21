@@ -31,7 +31,7 @@ export default async function CallsPage({
     <div className="h-full w-full space-y-5 overflow-y-auto p-2">
       <PageHeader
         title="Calls"
-        description="Stocks where something unusual is happening, what the model thinks of each, and the evidence behind it. Pick one on the left, or look up any stock below, to see why it is moving."
+        description="Stocks where something unusual is happening, what the model thinks of each, and the evidence behind it. Pick one on the left, or look up any stock below, to see why it is moving. The calls cover companies worth $10 billion or more."
         related={[
           { href: '/performance', label: 'Performance' },
           { href: '/markets', label: 'Markets' },

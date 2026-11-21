@@ -82,3 +82,52 @@ def test_the_discovery_engine_skips_market_beta_pearson_links_and_counts_them() 
     src = (ROOT / "services/correlation/statistical_discovery.py").read_text(encoding="utf-8")
     assert "beta_link = is_market_beta_pair(ticker_a, ticker_b)" in src and "and not beta_link" in src
     assert "correlation.statistical_discovery.market_beta_link" in src
+
+
+def test_a_held_index_pair_is_not_published_when_its_retest_survives():
+    """Seven index-beta pairs (QQQ-VXX, SPY-TSLA...) were published on 12 Nov by the hourly retest, which released held proposals
+    without the beta check the discovery path had."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from services.correlation import statistical_discovery as sd
+
+    sent = []
+
+    class Producer:
+        async def send(self, topic, proposal, key=None):
+            sent.append(proposal["pair"])
+
+    class Survival:
+        def __init__(self, regs):
+            self.regs = regs
+
+        async def due_for_retest(self, limit=50):
+            return self.regs
+
+        async def evaluate(self, edge_id, coefficient, p_value):
+            return SimpleNamespace(survived=True)
+
+        async def release(self, edge_id):
+            return {"proposal": {"pair": edge_id}, "key": edge_id}
+
+    def run(pairs, method="pearson"):
+        sent.clear()
+        eng = sd.StatisticalDiscoveryEngine.__new__(sd.StatisticalDiscoveryEngine)
+        eng.survival = Survival([SimpleNamespace(edge_id=f"{a}-{b}", source=a, target=b, method=method) for a, b in pairs])
+        eng.producer = Producer()
+
+        async def aligned(a, b):
+            return [float(i) for i in range(40)], [float(i) for i in range(40)]
+
+        eng.fetch_aligned_pair = aligned
+        real = sd.retest_statistic
+        sd.retest_statistic = lambda m, a, b: (0.9, 0.001)
+        try:
+            asyncio.run(eng.retest_due_edges())
+        finally:
+            sd.retest_statistic = real
+        return list(sent)
+
+    assert run([("SPY", "IONQ"), ("TSLA", "NVDA"), ("QQQ", "VXX")]) == ["TSLA-NVDA"]
+    assert run([("SPY", "IONQ")], method="granger") == ["SPY-IONQ"]            # a lead-lag edge is a different claim and is kept

@@ -239,6 +239,36 @@ def test_the_factor_engine_catches_up_when_a_night_was_missed():
     assert behind("not a date", 0) is True           # unreadable: run rather than wait a night
 
 
+def test_a_run_that_leaves_the_scores_behind_is_counted_and_logged():
+    """Seven nightly runs published as_of 6 Nov while 3 sessions were complete (outage sessions dropped); nothing said so (13 Nov 2026)."""
+    import asyncio
+    import json
+    import logging
+    from services.agents import factor_engine as fe
+    from shared.utils import quiet_failures as qf
+
+    class Raw:
+        async def get(self, k):
+            return json.dumps({"as_of": "2026-11-06"})
+
+    class Db:
+        def __init__(self, n):
+            self.n = n
+
+        async def query_one(self, sql, *a):
+            return {"n": self.n}
+
+    def check(n):
+        eng = fe.FactorEngine.__new__(fe.FactorEngine)
+        eng.redis, eng.db = Raw(), Db(n)
+        return asyncio.run(eng._warn_if_still_behind())
+
+    assert check(0) == 0 and check(1) == 1                      # caught up, or the normal one-session lag
+    qf.reset()
+    assert check(3) == 3
+    assert any("stale_after_run" in site for site in qf.snapshot()), "the stale run must be counted, not only logged"
+
+
 def test_a_restated_headline_is_stale_and_skipped():
     """Tetlock (2011); 14.1% of headlines restated one of the stock's previous
     ten on 30 Oct 2026, and each was scored again."""

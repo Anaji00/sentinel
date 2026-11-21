@@ -63,11 +63,12 @@ def test_priority_domains_appear_in_the_navigation():
     # its old address redirects there, so the navigation names the new page.
     for route in ("/filings", "/intel"):
         assert route in sidebar, f"{route} is missing from the navigation"
-    # Open-source intel is a view of /intel, and /osint redirects there.
-    intel = (FRONTEND / "app/(dashboard)/intel/page.tsx").read_text(encoding="utf-8")
-    assert "OsintThreatMatrix" in intel, "open-source intel is no longer reachable"
+    # Open-source intel has its own page (/osint) in the navigation; /intel?view=osint redirects to it.
+    assert "/osint" in sidebar, "open-source intel is missing from the navigation"
+    osint = (FRONTEND / "app/(dashboard)/osint/page.tsx").read_text(encoding="utf-8")
+    assert "OsintThreatMatrix" in osint, "open-source intel is no longer reachable"
     config = (FRONTEND.parent / "next.config.ts").read_text(encoding="utf-8")
-    assert '"/osint"' in config, "old /osint links no longer resolve"
+    assert '"/osint"' in config, "old /intelligence?view=osint links no longer resolve"
     assert "/graph" not in sidebar, "the removed graph view is back in the nav"
 
 

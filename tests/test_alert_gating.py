@@ -76,7 +76,9 @@ def test_a_new_edge_is_held_until_it_replicates() -> None:
     assert asyncio.run(eng._gate_edge(edge, "topic", {"x": 1}, "AAA")) is False and sent == []
     assert asyncio.run(eng.survival.release(edge)) == {"proposal": {"x": 1}, "key": "AAA"}
     eng.survival.redis.raw.h.setdefault(es.REPLICATED_KEY, {})[edge] = json.dumps({"at": __import__("time").time()})
-    assert asyncio.run(eng._gate_edge(edge, "topic", {"x": 2}, "AAA")) is True and sent == [({"x": 2}, "AAA")]
+    # Deliberate update (Neo4j audit 18 Nov, item c): a replicated edge is now sent with a replicated/last_check stamp in its properties.
+    assert asyncio.run(eng._gate_edge(edge, "topic", {"x": 2}, "AAA")) is True and len(sent) == 1 and sent[0][1] == "AAA"
+    assert sent[0][0]["x"] == 2 and sent[0][0]["data"]["properties"]["replicated"] is True and sent[0][0]["data"]["properties"]["last_check"] > 0
 
 
 def test_a_granger_edge_is_retested_as_granger_not_as_a_correlation() -> None:

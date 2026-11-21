@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
@@ -43,7 +43,7 @@ FLIP_WAIT_SEC = 30
 DONE_KEY = "auto_trade:done:{portfolio}:{day}"
 DEFAULT_LEG = 0.5
 PORTFOLIO = "b1_extremes"
-BOOK_KEY = "sentinel:auto_trade:book"          # {"rebalanced_on", "long", "short", "scores_as_of"}
+from shared.utils.signal_store import AUTO_TRADE_BOOK_KEY as BOOK_KEY      # {"rebalanced_on", "long", "short", "scores_as_of"}
 
 _SESSIONS_SINCE_SQL = "SELECT count(*) AS n FROM daily_bars WHERE ticker = 'SPY' AND day > $1::date AND day < $2::date"
 # A short costing more than the hard-to-borrow fee a year is not taken.
@@ -59,6 +59,7 @@ _PRICES_SQL = """
 # positions from an earlier book (spy_plus_overlay_industry_neutral, to 24 Oct
 # 2026) are its own to close, not a stranger's to leave alone.
 _MANAGED_SQL = "SELECT DISTINCT symbol FROM auto_trade_orders"
+_SESSIONS_AFTER_SQL = "SELECT count(DISTINCT day) AS n FROM daily_bars WHERE ticker = 'SPY' AND day > $1::date AND day < CURRENT_DATE"
 # The book's names with an alert in the last ALERT_RISK_DAYS, and the rule that fired.
 # Three days, not seven (30 Oct 2026): the graded lift is a 1- and 5-session
 # effect, and a week of alerts covered half the book.
@@ -111,6 +112,9 @@ _FILL_MISS_SQL = """
 # Safety (shared/utils/auto_trade.py): the halt flag, the book's equity record,
 # SPY's latest close, and 20-session average dollar volume per name.
 HALT_KEY = "sentinel:auto_trade:halt:{portfolio}"
+# One hash a day: what the run did or why it did not (orders_submitted, skip_reason, scores_sessions_behind, halted). Record only.
+RUN_RECORD_KEY = "sentinel:auto_trade:run:{portfolio}:{day}"
+RUN_RECORD_TTL_SEC = 90 * 86400
 _EQUITY_HISTORY_SQL = """
     SELECT equity, spy_close FROM auto_trade_equity WHERE portfolio = $1 AND day < $2 ORDER BY day DESC LIMIT 60
 """
@@ -207,7 +211,7 @@ class AutoTrader:
         logger.info("Auto-trader on: book %s in the Alpaca paper account", self.portfolio)
         while True:
             try:
-                out = await self.run_once()
+                out = await self._run_once_recorded()
                 if out.get("orders") is not None:
                     logger.info("Auto-trader: %s", out)
             except Exception as exc:
@@ -217,6 +221,41 @@ class AutoTrader:
             except Exception as exc:
                 swallowed("agents.auto_trader.record_fills", exc, logger)
             await asyncio.sleep(INTERVAL_SEC)
+
+    async def _run_once_recorded(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """run_once, then one durable record of the attempt. The result is returned unchanged; a failed write is counted."""
+        now = now or datetime.now(NY)
+        out = await self.run_once(now)
+        try:
+            await self._record_run(now, out)
+        except Exception as exc:
+            swallowed("agents.auto_trader.run_record", exc, logger)
+        return out
+
+    async def _record_run(self, now: datetime, out: Dict[str, Any]) -> None:
+        if self.raw is None:
+            return
+        today = now.date()
+        key = RUN_RECORD_KEY.format(portfolio=self.portfolio, day=today.isoformat())
+        if not out:
+            # Silent returns: before the trade time, or already traded today (a record exists), or market closed / no book. The
+            # last is the unrecoverable case of 19 Nov: written once, never over a real record.
+            if now.time() < TRADE_AFTER or await self._done(today) or await self.raw.exists(key):
+                return
+            reason, halted = "no_run: market closed or no stored book", False
+        else:
+            reason = str(out.get("skipped") or out.get("halted") or "")
+            halted = bool(out.get("halted"))
+        behind = await self._scores_sessions_behind()
+        await self.raw.hset(key, mapping={
+            "day": str(out.get("day") or today.isoformat()),
+            "orders_submitted": str(int(out.get("orders") or 0)),
+            "skip_reason": reason,
+            "scores_sessions_behind": "" if behind is None else str(behind),
+            "halted": "1" if halted else "0",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await self.raw.expire(key, RUN_RECORD_TTL_SEC)
 
     async def record_fills(self, now: Optional[datetime] = None) -> int:
         """Store what finished orders did. Today's wait for the close, since a day
@@ -256,6 +295,21 @@ class AutoTrader:
         except Exception as exc:
             swallowed("agents.auto_trader.engine_stale_read", exc, logger)
         return None
+
+    async def _scores_sessions_behind(self) -> Optional[int]:
+        """Completed sessions after the model report's as-of date, or None when it cannot be read."""
+        if self.raw is None:
+            return None
+        from shared.utils.signal_store import FACTOR_REPORT_KEY
+        try:
+            report = _json(await self.raw.get(FACTOR_REPORT_KEY), {})
+            as_of = date.fromisoformat(str((report or {}).get("as_of"))[:10])
+            row = await self.db.query_one(_SESSIONS_AFTER_SQL, as_of)
+            # The larger of the bars table's count and the calendar's: a stalled bar feed must not make old scores look fresh (review F12).
+            return max(int((row or {}).get("n") or 0), at.weekdays_between(as_of, datetime.now(NY).date()))
+        except Exception as exc:
+            swallowed("agents.auto_trader.scores_age_read", exc, logger)
+            return None
 
     async def _done(self, today: date) -> bool:
         if self.raw is None:
@@ -297,7 +351,14 @@ class AutoTrader:
             logger.warning("B1 risk-off veto: %s", "; ".join(f"{t} ({why})" for t, why in sorted(vetoes.items())[:10]))
             weights = at.apply_vetoes(weights, vetoes, veto_scale())
         account = await self.broker.get_account()
-        positions = await self.broker.get_positions()
+        try:
+            positions = await self.broker.get_positions()
+        except Exception as exc:
+            # An unreadable position list is not an empty one: planning against {} would open the whole book again (review F1).
+            # Transient, nothing is sold, retried on the next cycle.
+            swallowed("agents.auto_trader.positions", exc, logger)
+            dropped("agents.auto_trader.positions_unavailable", "orders skipped: the venue's position list could not be read", logger)
+            return {"day": today.isoformat(), "halted": "positions unavailable"}
         held = {p.symbol.upper(): float(p.qty) for p in positions}
         managed: Set[str] = {str(r["symbol"]) for r in await self.db.query(_MANAGED_SQL) or []}
         names = sorted(set(weights) | (set(held) & managed))
@@ -325,6 +386,14 @@ class AutoTrader:
         if stale:
             dropped("agents.auto_trader.engine_stale", f"orders skipped, factor engine silent: {stale}", logger)
             return {"day": today.isoformat(), "halted": f"factor engine: {stale}"}
+        # Scores that miss completed sessions are as stale as a silent engine: transient, nothing held is sold, retried on the
+        # next cycle, and it resolves by itself once the model's as-of date catches up. Stated as intended (13 Nov 2026, owner's
+        # 'close'): it also skips risk-off exits for the day, exactly as the silent-engine guard above and every halt do (a halt sells
+        # nothing to 'make safe'); the book is monthly and its exits come from the rebuild, which needs fresh scores.
+        old = at.scores_too_old(await self._scores_sessions_behind())
+        if old:
+            dropped("agents.auto_trader.scores_stale", f"orders skipped: {old}", logger)
+            return {"day": today.isoformat(), "halted": old}
         if reasons:
             await self._halt("; ".join(reasons))
             return {"day": today.isoformat(), "halted": "; ".join(reasons)}
@@ -343,6 +412,7 @@ class AutoTrader:
                for r in await self.db.query(_ADV_SQL, [p.symbol for p in plans]) or []}
         participation = _setting("AUTO_TRADE_MAX_ADV_SHARE", 0.01)
         plans = [at.liquidity_capped(p, prices.get(p.symbol, 0.0), adv.get(p.symbol), participation) for p in plans]
+        plans = [p for p in plans if p.qty > 0]       # a short capped under one whole share is not sent
         # Limit prices from a live reference: the latest IEX trade, else the
         # venue's own mark. `prices` is yesterday's close for any name not
         # held, so a band around it missed every stock that gapped at the open.
@@ -503,6 +573,11 @@ class AutoTrader:
             since = int((row or {}).get("n") or 0)
         if stored and not at.rebalance_due(since):
             return stored
+        # A rebuild is written only from fresh scores on a day that can trade. Stored before these guards (review F2), a rebuild from stale
+        # scores froze B1 on stale picks for a month, because the next day's rebalance_due read the new date. The stored book stays; the
+        # guards in run_once report why nothing trades today.
+        if await self._halted() or await self._engine_stale() or at.scores_too_old(await self._scores_sessions_behind()):
+            return stored
         from shared.utils import short_data as sd
         from shared.utils.asset_universe import load_asset_meta
         from shared.utils.signal_store import factor_scores_key
@@ -521,7 +596,9 @@ class AutoTrader:
         borrowable -= {str(r["ticker"]).upper() for r in await self.db.query(_FEES_SQL) or []
                        if float(r["fee_rate"]) > sd.HARD_TO_BORROW_FEE}
         long, short = at.b1_book(pct, borrowable)
-        book = {"rebalanced_on": today.isoformat(), "long": long, "short": short}
+        from shared.utils.signal_store import FACTOR_REPORT_KEY
+        as_of = str((_json(await self.raw.get(FACTOR_REPORT_KEY), {}) or {}).get("as_of") or "")[:10] or None
+        book = {"rebalanced_on": today.isoformat(), "long": long, "short": short, "scores_as_of": as_of}
         await self.raw.set(BOOK_KEY, json.dumps(book))
         logger.info("Auto-trader: new B1 book, %s long and %s short", len(long), len(short))
         return book

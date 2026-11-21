@@ -165,3 +165,29 @@ def shrink_to_prior(price, volume, prior=0.5, strength=2000.0):
     if not (_m.isfinite(p) and _m.isfinite(v)) or not 0.0 <= p <= 1.0 or v < 0 or strength <= 0:
         return None
     return (v * p + strength * prior) / (v + strength)
+
+def order_watch_list(dynamic_by_volume, stored, cap):
+    """The slugs to poll: this sweep's relevant markets in the order the sweep returned them (volume, highest first), then the other stored
+    slugs in a stable order, cut to `cap`. The sweep list is already filtered; only stored slugs that are not in it follow, so the
+    cap keeps liquid markets before quiet ones. (It was alphabetical: the sort threw the volume order away.)"""
+    seen = set()
+    ordered = []
+    wanted = set(stored)
+    for slug in dynamic_by_volume:
+        if slug in wanted and slug not in seen:
+            seen.add(slug)
+            ordered.append(slug)
+    ordered.extend(sorted(wanted - seen))
+    return ordered[:cap]
+
+
+def belongs_to_slug(market, parent, queried):
+    """Whether a market returned for `queried` really is that market or one of that event's markets. Gamma's /markets ignores an unknown
+    filter such as event_slug and answers with its default 20 markets, which were then labelled with every queried slug (a bitcoin
+    slug beside a Harris-nomination question, 13 Nov 2026)."""
+    if not isinstance(market, dict):
+        return False
+    return market.get("slug") == queried or (isinstance(parent, dict) and parent.get("slug") == queried)
+
+
+

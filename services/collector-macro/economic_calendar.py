@@ -31,6 +31,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from shared.models import NormalizedEvent, EventType, EntityType, Entity, MacroReleaseData, AnomalyBreakdown, RawEvent
 from shared.kafka import SentinelProducer, Topics
 
+from shared.utils.collector_metrics import for_service as _collector_metrics
 from shared.utils.quiet_failures import dropped, swallowed
 
 import importlib.util as _ilu
@@ -230,6 +231,7 @@ class EconomicCalendarCollector:
                     logger,
                     detail="no CPI/NFP/FOMC/PCE/GDP releases will be ingested",
                 )
+                _collector_metrics("collector-macro").upstream_error("finnhub_calendar")
         except Exception as e:
             swallowed("collector_macro.economic_calendar_fetch", e, logger)
         return []
@@ -433,6 +435,7 @@ class EconomicCalendarCollector:
                     "not enough observations to compute the release",
                     logger, variant=series.series_id,
                 )
+                _collector_metrics("collector-macro").rejected("fred_insufficient_history")
                 continue
             last_seen = None
             if raw is not None:

@@ -49,6 +49,69 @@ async def get_account_summary(redis = Depends(get_redis_optional)):
     return summary.model_dump()
 
 
+@router.get("/summary", dependencies=[Depends(require_role(Role.VIEWER))])
+async def get_portfolio_summary(redis=Depends(get_redis_optional), db=Depends(get_db_optional)):
+    """Header chip: the Alpaca paper account's equity now and its change since the last stored daily equity row (`base_date`). The row is
+    the trader's once-a-day record of the book, so the base is its value at that session's trade time, not the close. Missing figures are
+    null, never 0."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from shared.utils.portfolio_summary import summary as build_summary
+    from shared.utils.response_cache import cached_json
+
+    async def compute() -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        try:
+            # The Alpaca paper account the trader uses, not the gateway's default simulator (a fixed $100,000 with no positions).
+            broker = get_broker("alpaca", redis_client=redis)
+            account = (await broker.get_account()).model_dump()
+        except Exception as exc:
+            swallowed("api_gateway.portfolio.summary.account", exc, logger)
+            raise HTTPException(status_code=503, detail="The paper account is temporarily unavailable.")
+        try:
+            account["positions_count"] = len(await broker.get_positions())
+        except Exception as exc:                      # the chip still shows equity; the count is unknown, not zero
+            swallowed("api_gateway.portfolio.summary.positions", exc, logger)
+            account["positions_count"] = None
+        rows: list = []
+        if db is not None:
+            try:
+                rows = [(r["day"], r["equity"]) for r in await db.query(
+                    "SELECT day, equity FROM auto_trade_equity WHERE portfolio = 'b1_extremes' ORDER BY day DESC LIMIT 10") or []]
+            except Exception as exc:
+                swallowed("api_gateway.portfolio.summary.equity", exc, logger)
+        return build_summary(account, rows, now.astimezone(ZoneInfo("America/New_York")).date(), now)
+
+    return await cached_json(getattr(redis, "raw", redis), "api:portfolio:summary", compute, ttl=15, max_stale=120)
+
+
+@router.get("/b1-exposure", dependencies=[Depends(require_role(Role.VIEWER))])
+async def get_b1_exposure(redis=Depends(get_redis_optional), db=Depends(get_db_optional)):
+    """Read-only exposure of the stored B1 book: ex-ante beta by leg and net, leg volatilities, heaviest sectors (shared/utils/book_exposure.py). Nothing trades on it."""
+    from collections import defaultdict
+
+    from shared.utils.book_exposure import exposure
+    from shared.utils.response_cache import cached_json
+    from shared.utils.sectors import sector_of
+    from shared.utils.signal_store import AUTO_TRADE_BOOK_KEY
+
+    raw = getattr(redis, "raw", redis)
+    if raw is None or db is None:
+        raise HTTPException(status_code=503, detail="The book or price store is unavailable.")
+
+    async def compute() -> Dict[str, Any]:
+        book = json.loads(await raw.get(AUTO_TRADE_BOOK_KEY) or "{}")
+        names = sorted(set(book.get("long") or []) | set(book.get("short") or []) | {"SPY"})
+        bars: Dict[str, Dict[Any, float]] = defaultdict(dict)
+        for r in await db.query("SELECT ticker, day, close FROM daily_bars WHERE ticker = ANY($1::text[]) AND day > CURRENT_DATE - 260 AND close > 0 ORDER BY ticker, day", names) or []:
+            bars[r["ticker"]][r["day"]] = float(r["close"])
+        sectors = {r["ticker"]: sector_of(r["sic"]) for r in await db.query("SELECT ticker, sic FROM company_profile WHERE ticker = ANY($1::text[])", names) or []}
+        return exposure(book, bars, sectors)
+
+    return await cached_json(raw, "api:portfolio:b1-exposure", compute, ttl=300, max_stale=3600)
+
+
 @router.get("/positions", dependencies=[Depends(require_role(Role.VIEWER))])
 async def get_portfolio_positions(redis = Depends(get_redis_optional)):
     """Fetch all open positions with real-time unrealized P&L and market values."""

@@ -59,3 +59,10 @@ def test_without_a_cap_table_no_headline_is_read_or_scored() -> None:
 def test_the_floor_is_the_model_floor_not_the_calls_floor() -> None:
     src = (ROOT / "services/agents/llm_news_job.py").read_text(encoding="utf-8")
     assert "mc.large_caps(self.raw, mc.MODEL_MIN_MARKET_CAP_USD)" in src
+
+
+def test_requests_are_spaced_to_the_token_per_minute_bucket():
+    """The third request in a minute met a full 8,000-token bucket: 38 refusals in a day (13 Nov 2026)."""
+    from shared.utils import llm_news as ln
+    assert ln.pace_seconds(8000) == 14.06                  # 1,500 tokens at 80% of 8,000 a minute
+    assert ln.pace_seconds(0) == 0.0 and ln.pace_seconds(250000) < 1.0

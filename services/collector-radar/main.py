@@ -44,7 +44,7 @@ from shared.utils.heartbeat import start_heartbeat_task
 from shared.utils.equities import is_valid_primary_equity
 
 from regime import MarketRegime
-from shared.utils.collector_metrics import CollectorMetrics
+from shared.utils.collector_metrics import CollectorMetrics, us_equity_window_open
 from shared.utils.tasks import safe_create_task
 
 # ─── CONFIGURATION & STANDARDS ────────────────────────────────────────────────
@@ -700,7 +700,7 @@ async def main():
         # A collector that connects and then evaluates nothing is the hardest
         # failure to see: no exception, no restart, a healthy heartbeat, an empty
         # panel indistinguishable from a quiet market.
-        safe_create_task(metrics.watch_for_starvation(source="alpaca"))
+        safe_create_task(metrics.watch_for_starvation(source="alpaca", window_open=us_equity_window_open))
         refresh_every = 60          # cycles; one cycle is ~60s
         try:
             while True:

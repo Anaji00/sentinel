@@ -169,6 +169,11 @@ function AssetSparklineCard({
   const flash = useFlash(latestPoint?.price);
 
   const priceChange = latestPoint && firstPoint ? latestPoint.price - firstPoint.price : 0;
+  // A yield is a percentage, so it is shown as one and its move in points; an index is not money.
+  const isYield = /^US\d\dY$/.test(config.symbol);
+  const isIndex = config.symbol === 'VIX' || config.symbol === 'DJI';
+  const windowHours = latestPoint && firstPoint ? (Date.parse(latestPoint.timestamp) - Date.parse(firstPoint.timestamp)) / 3_600_000 : 0;
+  const windowLabel = windowHours >= 1 ? `change over the last ${Math.round(windowHours)} hours` : windowHours > 0 ? `change over the last ${Math.max(1, Math.round(windowHours * 60))} minutes` : '';
   const pctChange = firstPoint && firstPoint.price > 0 ? (priceChange / firstPoint.price) * 100 : 0;
   // The line takes the direction's colour, as every other price line here does:
   // a falling S&P drawn in the accent read as "selected", not "down".
@@ -240,7 +245,9 @@ function AssetSparklineCard({
         {hasData ? (
           <>
             <div className={`text-lead font-bold leading-none text-ink px-1 -mx-1 ${flashClass(flash)}`}>
-              ${latestPoint?.price ? formatNumber(latestPoint.price, { decimals: 2 }) : '0.00'}
+              {latestPoint?.price
+                ? `${isYield || isIndex ? '' : '$'}${formatNumber(latestPoint.price, { decimals: 2 })}${isYield ? '%' : ''}`
+                : '—'}
             </div>
             <div
               className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-bold ${pctChange >= 0 ? 'bg-positive/15 text-positive' : 'bg-negative/15 text-negative'}`}
@@ -250,16 +257,14 @@ function AssetSparklineCard({
               ) : (
                 <TrendingDown className="w-3 h-3" />
               )}
-              {pctChange >= 0 ? '+' : ''}
-              {pctChange.toFixed(2)}%
+              {isYield
+                ? `${priceChange >= 0 ? '+' : '−'}${Math.abs(priceChange).toFixed(2)} points`
+                : `${pctChange >= 0 ? '+' : '−'}${Math.abs(pctChange).toFixed(2)}%`}
             </div>
           </>
         ) : (
           <div className="flex items-center gap-2 py-1">
-            <span className="h-2 w-2 rounded-full bg-caution animate-ping" />
-            <span className="text-xs font-bold text-caution uppercase tracking-wider animate-pulse">
-              Waiting for the stream…
-            </span>
+            <span className="text-xs text-ink-mute">No prices yet</span>
           </div>
         )}
       </div>
@@ -307,14 +312,11 @@ function AssetSparklineCard({
           </svg>
         ) : (
           <div className="flex flex-col items-center justify-center gap-1.5 text-center p-2">
-            <Radio className="w-5 h-5 text-caution/80 animate-pulse" />
-            <span className="text-micro text-ink-dim font-bold uppercase tracking-wider">
-              {describeApiError(feedError) ?? 'Waiting for the backend'}
+            <span className="font-sans text-xs text-ink-dim">
+              {describeApiError(feedError) ?? 'No prices are stored for this market yet.'}
             </span>
-            <span className="text-micro text-ink-mute">
-              {feedError
-                ? 'THE SERIES REQUEST DID NOT SUCCEED'
-                : 'POLLING WEBSOCKET / REST FEED (3S)'}
+            <span className="font-sans text-micro text-ink-mute">
+              {feedError ? 'The request for prices did not succeed.' : 'It fills in when the next price arrives.'}
             </span>
           </div>
         )}
@@ -330,13 +332,12 @@ function AssetSparklineCard({
             {activeHover ? (
               <span className="text-accent font-bold">${activeHover.price.toFixed(2)}</span>
             ) : (
-              <span aria-hidden />
+              <span className="font-sans text-ink-mute">{windowLabel}</span>
             )}
           </>
         ) : (
-          <span className="text-caution/90 font-bold uppercase tracking-widest text-micro flex items-center gap-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-caution animate-ping" />
-            No recent events stored
+          <span className="font-sans text-micro text-ink-mute">
+            No recent prices
           </span>
         )}
       </div>
@@ -351,6 +352,12 @@ import { useDialog } from '@/components/ui/useDialog';
 import { POLL } from '@/components/ui/DataProvider';
 
 /** Every market's price chart, by category: the Prices view of /charts. */
+/** Markets with no stored bars of their own, and the fund that tracks each. The chart says it is showing the fund. */
+const CANDLE_PROXY: Record<string, { ticker: string; note: string }> = {
+  DJI: { ticker: 'DIA', note: 'The Dow itself has no stored bars. This is DIA, the fund that tracks it.' },
+  BRENT: { ticker: 'BNO', note: 'Brent crude itself has no stored bars. This is BNO, a fund that tracks its price.' },
+};
+
 /** The other names the same live price is kept under, looked up by the exact symbol the tick carries. */
 const LIVE_ALIASES: Record<string, string[]> = Object.fromEntries(
   [
@@ -520,7 +527,8 @@ export default function MarketCharts() {
               </Button>
             </div>
             <div className="space-y-3 overflow-y-auto p-4">
-              <CandleChart ticker={expandedAsset.symbol} />
+              {CANDLE_PROXY[expandedAsset.symbol] && <p className="text-micro text-ink-dim">{CANDLE_PROXY[expandedAsset.symbol].note}</p>}
+              <CandleChart ticker={CANDLE_PROXY[expandedAsset.symbol]?.ticker ?? expandedAsset.symbol} />
               {expandedValues.length > 1 && (
                 <div className="space-y-1.5 rounded-md border border-line bg-raised p-3">
                   <p className="text-micro text-ink-dim">

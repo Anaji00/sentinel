@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NOT_PROVIDED, briefBlocks, horizonWords, isNotMeasured, measuresLines, situationLine, stageView } from '../lib/divergence';
+import { NOT_PROVIDED, briefBlocks, horizonWords, isNotMeasured, measuresLines, foldAlerts, plainReason, plainRegimeLabel, directionNote, DIRECTION_NOT_ESTABLISHED, regimeView, situationLine, stageView } from '../lib/divergence';
 
 const brief = {
   what_happened: 'X +4.00% while its industry group +0.50%: a gap of +3.50%.',
@@ -111,5 +111,51 @@ describe('alert kinds', () => {
     expect(filterAlerts(alerts, 'divergence').map((a) => a.id)).toEqual([1, 3]);
     expect(filterAlerts(alerts, 'other').map((a) => a.id)).toEqual([2, 4]);
     expect(ALERT_KINDS.map((k) => k.id)).toEqual(['all', 'divergence', 'other']);
+  });
+});
+
+describe('regime wording from the backend codes', () => {
+  it('turns the label codes into words', () => {
+    expect(plainRegimeLabel('UNEXPLAINED_DISLOCATION')).toBe('Unexplained move');
+    expect(plainRegimeLabel('CROWDED_NO_EDGE')).toBe('Crowded trade, no clear edge');
+    expect(plainRegimeLabel('some new label')).toBe('Some new label');
+  });
+  it('never shows an action, whatever code the backend sends', () => {
+    const v = regimeView({ label: 'UNEXPLAINED_DISLOCATION', action: 'fade_buy', reasons: [] });
+    expect(v?.action).toBe(DIRECTION_NOT_ESTABLISHED);
+    expect(JSON.stringify(v)).not.toMatch(/fade_buy|buy|sell/i);
+  });
+  it('says a peer-cointegration rule expects a bigger move, not a direction', () => {
+    expect(directionNote('Quantitative Equity Peer Cointegration & Decoupling')).toContain('which way is not known');
+    expect(directionNote('Stock Moving Against Its Peers, No News')).toBeNull();
+    expect(directionNote(null)).toBeNull();
+  });
+  it('drops the statistics word from a reason', () => {
+    expect(plainReason('residual of -3.8 sigma against peers')).toBe('gap of -3.8 usual-sized moves against peers');
+    expect(plainReason('no adverse filing')).toBe('no adverse filing');
+  });
+});
+
+describe('foldAlerts', () => {
+  const a = (id: string, d: string, at: string) => ({ correlation_id: id, description: d, detected_at: at });
+  it('folds alerts on the same stock and day under the first', () => {
+    const out = foldAlerts([a('1', 'NLY moved', '2026-11-13T14:00:00Z'), a('2', 'AAPL moved', '2026-11-13T14:05:00Z'), a('3', 'NLY again', '2026-11-13T15:00:00Z')]);
+    expect(out.map((x) => x.lead.correlation_id)).toEqual(['1', '2']);
+    expect(out[0].others.map((x) => x.correlation_id)).toEqual(['3']);
+  });
+  it('keeps different days and ticker-less alerts apart', () => {
+    const out = foldAlerts([a('1', 'NLY moved', '2026-11-13T14:00:00Z'), a('2', 'NLY moved', '2026-11-14T14:00:00Z'), a('3', 'a market wide move', '2026-11-13T14:00:00Z'), a('4', 'a market wide move', '2026-11-13T14:00:00Z')]);
+    expect(out).toHaveLength(4);
+  });
+});
+
+describe('regimeView', () => {
+  it('words a regime with its reasons', () => {
+    const v = regimeView({ label: 'unexplained dislocation', action: 'Watch for a catalyst.', reasons: ['No news', ''], missing: ['options'] });
+    expect(v).toEqual({ heading: 'Unexplained move', action: DIRECTION_NOT_ESTABLISHED, reasons: ['No news'], missing: ['options'] });
+  });
+  it('is null without a label', () => {
+    expect(regimeView(null)).toBeNull();
+    expect(regimeView({ label: '  ' })).toBeNull();
   });
 });

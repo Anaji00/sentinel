@@ -176,7 +176,7 @@ async def poll_telegram_channel(
             )
 
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=channel)
-            _collector_metrics("collector-social").ingested()
+            _collector_metrics("collector-social").ingested(source="telegram")
             new_count += 1
 
     except Exception as e:
@@ -208,6 +208,11 @@ async def poll_reddit_subreddit(
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 dropped("collector_social.reddit", f"http_{resp.status}", logger, detail=subreddit)
+                # The upstream refused us, not a parse failure of ours: count it
+                # where the dashboard looks. 1,504 http_404 drops went by with
+                # collector_upstream_errors_total at 0 because only dropped()
+                # was called.
+                _collector_metrics("collector-social").upstream_error("reddit")
                 return 0
             feed = await resp.text()
 
@@ -220,6 +225,7 @@ async def poll_reddit_subreddit(
             created_utc = p_data["created_utc"]
 
             if not post_id or not title:
+                _collector_metrics("collector-social").rejected("reddit_entry_missing_id_or_title")
                 continue
 
             item_key = f"reddit:{subreddit}:{post_id}"
@@ -248,7 +254,7 @@ async def poll_reddit_subreddit(
             )
 
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=subreddit)
-            _collector_metrics("collector-social").ingested()
+            _collector_metrics("collector-social").ingested(source="reddit")
             new_count += 1
 
     except Exception as e:
@@ -317,7 +323,7 @@ async def poll_twitter_handle(
                 }
             )
             await producer.send(Topics.RAW_SOCIAL, event.model_dump(), key=handle)
-            _collector_metrics("collector-social").ingested()
+            _collector_metrics("collector-social").ingested(source="twitter")
             new_count += 1
 
     except Exception as e:
@@ -368,7 +374,13 @@ async def main():
     # these prove it is still producing.
     metrics = _collector_metrics("collector-social")
     await metrics.start(redis_client)
-    hb_task = safe_create_task(start_heartbeat_task(redis_client, "collector-social"))
+    # Per-leg freshness in the heartbeat: Telegram keeps the collector-level
+    # last-success fresh while Reddit is dead, so the leg has to be named.
+    metrics.expect_sources("telegram", "reddit", "twitter")
+    hb_task = safe_create_task(start_heartbeat_task(
+        redis_client, "collector-social",
+        metadata=lambda: {"source_age_sec": metrics.source_freshness(), **metrics.snapshot()},
+    ))
 
     connector = aiohttp.TCPConnector(limit=20)
     try:

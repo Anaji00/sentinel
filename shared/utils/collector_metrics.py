@@ -24,12 +24,24 @@ is `time() - last_success`, i.e. staleness.
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from shared.utils.metrics import MetricsCollector, bind_redis
+from shared.utils.market_session import Session, current_session
+from shared.utils.metrics import _GAUGE_METRICS, MetricsCollector, bind_redis
 from shared.utils.tasks import safe_create_task
 
 logger = logging.getLogger("sentinel.collector_metrics")
+
+
+def us_equity_window_open(now: float) -> bool:
+    """True while US equities trade at all (pre-market through after-hours).
+
+    Pass as `window_open` to `watch_for_starvation` for collectors whose data
+    follows the cash session. Weekends and exchange holidays read as closed.
+    """
+    from datetime import datetime, timezone
+
+    return current_session(datetime.fromtimestamp(now, tz=timezone.utc)) != Session.CLOSED
 
 
 class CollectorMetrics:
@@ -54,6 +66,11 @@ class CollectorMetrics:
         # None until the first record arrives, so the watcher can tell
         # "never received anything" from "received some, now quiet".
         self._last_ingest_at: Optional[float] = None
+        # Last arrival per upstream source inside this collector. One collector
+        # can carry several legs (collector-social: telegram, reddit, twitter),
+        # and the process-level `last_success` is fresh while any one of them
+        # delivers, which hides a dead leg. None means "expected, never seen".
+        self._source_last_at: Dict[str, Optional[float]] = {}
 
     async def start(self, redis_client: Any = None) -> None:
         """Bind Redis so these counters reach the gateway's /metrics."""
@@ -69,14 +86,43 @@ class CollectorMetrics:
             except Exception as e:
                 logger.debug("Metrics binding skipped for %s: %s", self.name, e)
 
-    def ingested(self, count: int = 1) -> None:
-        """Records records successfully published downstream."""
+    def ingested(self, count: int = 1, source: Optional[str] = None) -> None:
+        """Records records successfully published downstream.
+
+        `source` names the leg that delivered them, for collectors with more
+        than one; it feeds `source_freshness()`.
+        """
         if count <= 0:
             return
+        now = time.time()
         self._ingested += count
-        self._last_ingest_at = time.time()
+        self._last_ingest_at = now
         MetricsCollector.increment(f"collector_ingested_total:{self.name}", count)
-        MetricsCollector.set_gauge(f"collector_last_success_epoch:{self.name}", time.time())
+        MetricsCollector.set_gauge(f"collector_last_success_epoch:{self.name}", now)
+        # A record arriving is the evidence the starvation flag was waiting
+        # for; waiting up to a check interval for the watcher to notice leaves
+        # a flowing collector reading as starved.
+        if _GAUGE_METRICS.get(f"collector_starved:{self.name}") == 1.0:
+            MetricsCollector.set_gauge(f"collector_starved:{self.name}", 0.0)
+        if source:
+            self._source_last_at[source] = now
+            MetricsCollector.set_gauge(f"collector_source_last_success_epoch:{self.name}:{source}", now)
+
+    def expect_sources(self, *sources: str) -> None:
+        """Declares legs that should deliver, so a never-delivering one shows."""
+        for source in sources:
+            self._source_last_at.setdefault(source, None)
+
+    def source_freshness(self, now: Optional[float] = None) -> Dict[str, Optional[float]]:
+        """Seconds since each declared or seen source last delivered.
+
+        None for a source that has not delivered since this process started.
+        """
+        t = time.time() if now is None else now
+        return {
+            src: (None if at is None else round(max(0.0, t - at), 1))
+            for src, at in sorted(self._source_last_at.items())
+        }
 
     def rejected(self, reason: str = "unspecified", count: int = 1) -> None:
         """Records records received but not usable.
@@ -103,6 +149,8 @@ class CollectorMetrics:
         expect_within_sec: float = 300.0,
         check_interval_sec: float = 60.0,
         source: str = "upstream",
+        window_open: Optional[Callable[[float], bool]] = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         """Logs loudly when a connected source stops producing.
 
@@ -119,16 +167,36 @@ class CollectorMetrics:
 
         It never raises and never exits on its own: the collector should keep
         trying, but the operator should be told it is trying in vain.
+
+        `window_open(now)` says whether data is expected at all. A collector
+        that follows the US cash session is legitimately silent for 17.5 hours
+        a day; with a fixed window radar logged "produced nothing" 14,682
+        times, and a genuine mid-session stall looked like the other 14,681.
+        Outside the window the flag is cleared and idle time is measured from
+        the moment the window reopened, not from the last pre-close record.
+        `clock` exists so a test can drive the watcher through a session.
         """
         import asyncio
 
-        started = time.time()
+        started = clock()
         warned = False
+        reopened_at = started
+        was_open = True
 
         while True:
             try:
                 await asyncio.sleep(check_interval_sec)
-                idle = time.time() - (self._last_ingest_at or started)
+                now = clock()
+                is_open = True if window_open is None else bool(window_open(now))
+                if not is_open:
+                    was_open = False
+                    warned = False
+                    MetricsCollector.set_gauge(f"collector_starved:{self.name}", 0.0)
+                    continue
+                if not was_open:
+                    reopened_at = now
+                    was_open = True
+                idle = now - max(self._last_ingest_at or started, reopened_at)
 
                 if self._ingested == 0 and idle >= expect_within_sec:
                     if not warned:

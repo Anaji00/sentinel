@@ -530,6 +530,15 @@ def risk_terms(direction: int, entry: Optional[float], stop: Optional[float], ad
     return out
 
 
+MAX_IDEAS_PER_GROUP = 3     # names from one industry or return cluster on one side of one horizon's idea list
+
+
+def group_is_full(kept_groups, group, limit: int = MAX_IDEAS_PER_GROUP) -> bool:
+    """Whether `limit` kept ideas on this side already come from `group`. An unknown group is never full: unknown is not one group. The
+    112 graded monthly ideas of 8 to 14 Oct were one AI-hardware episode (12 of 23 longs), so their results counted as about one observation."""
+    return bool(group) and sum(1 for g in kept_groups if g == group) >= limit
+
+
 def change_base(days: Sequence[date], closes: Sequence[float], today: date, session_open: bool) -> Tuple[Optional[float], Optional[date]]:
     """(close, its date) that a live price's move is measured from: the last COMPLETED session's close.
 
@@ -547,7 +556,7 @@ def change_base(days: Sequence[date], closes: Sequence[float], today: date, sess
 
 
 __all__ = [
-    "change_base", "EARNINGS_CYCLE_DAYS", "earnings_inside", "next_earnings", "risk_terms",
+    "MAX_IDEAS_PER_GROUP", "group_is_full", "change_base", "EARNINGS_CYCLE_DAYS", "earnings_inside", "next_earnings", "risk_terms",
     "EVENT_GROUPS", "EVIDENCE_WEIGHTS", "EXPIRY_WINDOWS", "Leg", "atr", "evidence_balance", "event_led", "idea_screen",
     "build_option_idea", "choose_structure", "iv_regime", "overruled", "realized_vol", "stock_ideas",
     "stock_plan", "tradable_chain",

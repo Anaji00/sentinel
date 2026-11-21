@@ -4,6 +4,8 @@ import {
   rankWords,
   rightWayOdds,
   expectedMove,
+  forecastIsPlateau,
+  sharedForecastKeys,
   type Idea,
   type Recommendations,
 } from '../lib/ideas';
@@ -139,5 +141,28 @@ describe('direction and odds without colour', () => {
     expect(oddsWords(0.56)).toBe('a bit better than even');
     expect(oddsWords(0.64)).toBe('better than even');
     expect(oddsWords(0.75)).toBe('strong odds');
+  });
+});
+
+describe('a shared expected move is not a forecast', () => {
+  const list = [idea('A', 1, 32.5, 0.05), idea('B', 1, 32.5, 0.05), idea('C', 1, 32.5, 0.05), idea('D', -1, -255, 0.05)];
+  it('flags a value three or more ideas share exactly', () => {
+    const shared = sharedForecastKeys(list);
+    expect(forecastIsPlateau(list[0], shared)).toBe(true);
+    expect(forecastIsPlateau(list[3], shared)).toBe(false);
+  });
+  it('needs three: two the same is not a plateau', () => {
+    expect(sharedForecastKeys(list.slice(0, 2)).size).toBe(0);
+  });
+  it('believes the backend flag when it says flat, but an exact tie still counts when it says not flat', () => {
+    const shared = sharedForecastKeys(list);
+    const flaggedFalse = { ...list[0], forecast: { ...list[0].forecast!, calibration_flat: false } } as Idea;
+    const flaggedTrue = { ...list[3], forecast: { ...list[3].forecast!, calibration_flat: true } } as Idea;
+    expect(forecastIsPlateau(flaggedFalse, shared)).toBe(true);
+    expect(forecastIsPlateau(flaggedTrue, shared)).toBe(true);
+  });
+  it('handles an empty list and ideas with no forecast', () => {
+    expect(sharedForecastKeys(undefined).size).toBe(0);
+    expect(forecastIsPlateau({ ...list[0], forecast: null } as Idea, new Set([325]))).toBe(false);
   });
 });

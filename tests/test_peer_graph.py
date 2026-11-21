@@ -285,3 +285,22 @@ def test_the_ratio_bar_sits_between_the_two_populations():
     stale = _mostly_frozen()
     assert len(set(stale)) / len(stale) < MIN_DISTINCT_RATIO
     assert MIN_DISTINCT_RATIO < 0.9
+
+
+def test_a_pair_with_a_broad_market_index_is_never_a_peer() -> None:
+    import random
+    from services.correlation import peer_graph as pg
+    rng = random.Random(3)
+    base = [rng.gauss(0, 1) for _ in range(300)]
+
+    def prices(noise):
+        p, out = 100.0, []
+        for b in base:
+            p *= 1 + 0.01 * (b + noise * rng.gauss(0, 1))
+            out.append(p)
+        return out
+
+    series = {"AAA": prices(0.1), "BBB": prices(0.1), "SPY": prices(0.1), "ES=F": prices(0.1)}
+    pairs = {frozenset((e.source, e.target)) for e in pg.derive_peers(series)}
+    assert frozenset(("AAA", "BBB")) in pairs
+    assert not any({"SPY", "ES=F"} & set(p) for p in pairs)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 WINDOW_DAYS = 14
 MIN_BUYERS = 2
@@ -78,9 +78,20 @@ def find_clusters(ticker: str, trades: Sequence[FormFourTrade]) -> List[Cluster]
     return out
 
 
+def distinct_trades(records: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """(the live rolling window with repeated lines collapsed, how many were repeats). A line repeated with the same insider, side, shares, price and dollar value is
+    the same transaction arriving twice (a re-delivered or amended filing); each arrival was stored under its own timestamp, so the rule's dollars counted it twice.
+    The earliest arrival is kept. The rebuilt history never had the repeats: it reads one row per transaction."""
+    seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for r in sorted(records, key=lambda x: float(x.get("timestamp") or 0.0)):
+        key = (r.get("ticker"), r.get("insider_name"), r.get("tx_type"), r.get("shares"), r.get("price"), r.get("total_usd"))
+        seen.setdefault(key, r)
+    return list(seen.values()), len(records) - len(seen)
+
+
 def event_id(ticker: str, day: date) -> str:
     """Deterministic, so a re-run inserts nothing new."""
     return f"g3cluster:{ticker}:{day.isoformat()}"
 
 
-__all__ = ["Cluster", "FormFourTrade", "SOURCE", "WINDOW_DAYS", "event_id", "find_clusters", "trade_usd"]
+__all__ = ["Cluster", "FormFourTrade", "SOURCE", "WINDOW_DAYS", "distinct_trades", "event_id", "find_clusters", "trade_usd"]

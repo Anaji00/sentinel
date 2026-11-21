@@ -64,6 +64,9 @@ async def run_forever() -> None:
     if not key:
         logger.warning("Vendor shares: no FINNHUB_API_KEY; not running.")
         return
+    from shared.utils.retry_sleep import next_delay
+
+    failures = 0
     await asyncio.sleep(300)
     while True:
         try:
@@ -86,5 +89,9 @@ async def run_forever() -> None:
             logger.info("Vendor shares: %s of %s ranked stocks without an SEC share count filled from Finnhub.",
                         stored, len(tickers))
         except Exception as e:
+            failures += 1
             swallowed("collector_filings.vendor_shares", e, logger)
-        await asyncio.sleep(INTERVAL_SEC)
+        else:
+            failures = 0
+        # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, INTERVAL_SEC))

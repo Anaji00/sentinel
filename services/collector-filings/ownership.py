@@ -44,6 +44,7 @@ from shared.utils.ownership import (  # noqa: E402
 )
 from shared.kafka import Topics  # noqa: E402
 from shared.models import NormalizedEvent, RawEvent  # noqa: E402
+from shared.utils.collector_metrics import for_service as _collector_metrics  # noqa: E402
 from shared.utils.quiet_failures import dropped, swallowed  # noqa: E402
 from shared.utils.quote_cache import quote_key  # noqa: E402
 
@@ -284,6 +285,7 @@ async def _load_holdings(
     await asyncio.sleep(SEC_PAUSE_SEC)
     if not url:
         dropped("collector_filings.ownership.no_infotable", "13F with no information table", logger, variant=filer.filer_id)
+        _collector_metrics("collector-filings").rejected("13f_no_infotable")
         return None
 
     fd, path = tempfile.mkstemp(suffix=".xml")

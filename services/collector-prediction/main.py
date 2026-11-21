@@ -243,7 +243,7 @@ def _is_binary_market(outcome_names: list) -> bool:
 # written by the enrichment service and pruned here. Two filters over one
 # Redis set is how `will-wti-dip-to-90-in-september-2026` came to be added on
 # every enriched event and removed on every sweep.
-from shared.utils.prediction_markets import is_relevant_market as _is_relevant_market
+from shared.utils.prediction_markets import belongs_to_slug, is_relevant_market as _is_relevant_market, order_watch_list
 
 # How many questions this collector will track at once. Each costs a Gamma
 # request per sync cycle.
@@ -303,9 +303,19 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 
                 # 2. Fetch dynamic active slugs from Polymarket
                 try:
+                    # Gamma serves at most 100 markets a request whatever `limit` says (limit=300 returned 100), so the volume-ranked
+                    # sweep is read in four pages of 100: only 16 relevant markets were in the first page.
                     async with session.get(markets_url, timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json()
+                            for offset in (100, 200, 300):
+                                if not isinstance(data, list) or len(data) < offset:
+                                    break
+                                async with session.get(f"{markets_url}&offset={offset}", timeout=10) as more:
+                                    page = await more.json() if more.status == 200 else []
+                                if not isinstance(page, list) or not page:
+                                    break
+                                data = data + page
                             # Filtered by subject, not only by volume.
                             #
                             # The request above orders by volume descending and
@@ -323,10 +333,12 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                             # membership. Slugs a person put in Redis by hand are
                             # never filtered: an explicit human choice outranks
                             # this heuristic.
-                            dynamic_slugs = sorted({
+                            # In the order the sweep returned them (volume, highest first): sorted() threw that order
+                            # away and the cap then kept arbitrary markets over liquid ones.
+                            dynamic_slugs = list(dict.fromkeys(
                                 m.get("slug") for m in data
                                 if m.get("slug") and _is_relevant_market(m)
-                            })
+                            ))
                             skipped = sum(
                                 1 for m in data
                                 if m.get("slug") and not _is_relevant_market(m)
@@ -356,40 +368,38 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                 # every question that was briefly popular stayed subscribed
                 # forever, and each one costs a Gamma request per sync cycle.
                 if len(watched_slugs) > MAX_WATCHED_SLUGS:
-                    # "The most recent" was not a property this could have.
-                    #
-                    # `watched_slugs` came from `smembers`, and a Redis set has
-                    # no order -- so `[-60:]` took an arbitrary tail and the log
-                    # line called it recency. The evidence was in the tracked
-                    # list: fixtures dated a week earlier, on a poller claiming
-                    # to sync the newest.
-                    #
-                    # Ordering is now something the data supports. The current
-                    # sweep returned these markets active and volume-ranked
-                    # moments ago, so they lead; the rest follow in a stable
-                    # order rather than an arbitrary one.
-                    fresh = [x for x in dynamic_slugs if x in set(watched_slugs)]
-                    rest = sorted(set(watched_slugs) - set(fresh))
-                    ordered = fresh + rest
+                    # The current sweep's relevant markets lead in volume order, then the other stored slugs in a stable order
+                    # (shared/utils/prediction_markets.order_watch_list).
+                    in_sweep = sum(1 for x in dynamic_slugs if x in set(watched_slugs))
                     logger.info(
-                        "Polymarket watch list at %d relevant slugs, above the %d "
-                        "ceiling; keeping the %d the current sweep returned active, "
-                        "then %d more in a stable order.",
-                        len(watched_slugs), MAX_WATCHED_SLUGS,
-                        min(len(fresh), MAX_WATCHED_SLUGS),
-                        max(0, MAX_WATCHED_SLUGS - len(fresh)),
+                        "Polymarket watch list at %d relevant slugs, above the %d ceiling; keeping the %d the current sweep returned "
+                        "(volume order), then %d more in a stable order.",
+                        len(watched_slugs), MAX_WATCHED_SLUGS, min(in_sweep, MAX_WATCHED_SLUGS), max(0, MAX_WATCHED_SLUGS - in_sweep),
                     )
-                    watched_slugs = ordered[:MAX_WATCHED_SLUGS]
+                    watched_slugs = order_watch_list(dynamic_slugs, watched_slugs, MAX_WATCHED_SLUGS)
 
                 logger.info(f"Heartbeat | Polymarket sync. Tracked slugs ({len(watched_slugs)}): {watched_slugs}")
                 new_assets = []
 
+                dead_slugs = []
                 for slug in watched_slugs:
                     try:
-                        url = f"{base_url}?event_slug={slug}"
+                        # `slug=` filters /markets; `event_slug=` is ignored there and returned Gamma's default 20 markets for every
+                        # slug, which were then labelled with the queried one. A slug that is an event, not a market, is read from
+                        # /events; one that answers nothing on both is closed and is dropped from the set below.
+                        url = f"{base_url}?slug={slug}"
                         async with session.get(url, timeout=10) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
+                                if isinstance(data, list) and not data:
+                                    async with session.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=10) as ev:
+                                        events_answered = ev.status == 200
+                                        if events_answered:
+                                            data = await ev.json()
+                                    # Dropped only when BOTH endpoints answered cleanly and empty: a 429 or 5xx on /events leaves `data`
+                                    # empty too, and an outage must not purge the watch list (hand-added slugs included).
+                                    if events_answered and isinstance(data, list) and not data:
+                                        dead_slugs.append(slug)
                                 
                                 # Gamma returns Events, which contain Markets. The
                                 # parent is kept rather than flattened away: a
@@ -404,6 +414,9 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
 
                                 for market, parent_event in markets:
                                     if not isinstance(market, dict) or market.get("closed"): 
+                                        continue
+                                    if not belongs_to_slug(market, parent_event, slug):
+                                        swallowed("collector_prediction.slug_mismatch", ValueError(f"{market.get('slug')} returned for {slug}"), logger)
                                         continue
 
                                     question = market.get("question", "")
@@ -467,6 +480,12 @@ async def stream_polymarket(producer: SentinelProducer, redis_client):
                     except Exception as e:
                         logger.error(f"Gamma API connection error for {slug}: {e}")
                 
+                if dead_slugs:
+                    try:
+                        await redis_client.raw.srem(redis_key, *dead_slugs)
+                        logger.info("Polymarket watch list: dropped %d slug(s) that answer nothing open on /markets or /events", len(dead_slugs))
+                    except Exception as exc:
+                        swallowed("collector_prediction.prune_dead_slugs", exc, logger)
                 if new_assets:
                     await ws.send(json.dumps({"assets_ids": new_assets, "type": "market"}))
                     logger.info(f"Polymarket: Subscribed to {len(new_assets)} new outcome tokens.")

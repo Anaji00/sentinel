@@ -24,6 +24,10 @@ export interface Preferences {
   focus: Focus;
   welcomed: boolean;
   notify?: NotifyPrefs;
+  /** When this person last pressed "mark all as seen" on the digest; the cut-off for what changed since. */
+  last_seen_at?: string | null;
+  /** Small yes/no flags kept on the account, such as which introductions have been seen. */
+  flags?: Record<string, boolean>;
 }
 
 export const PREFERENCES_KEY = '/me/preferences';

@@ -82,3 +82,13 @@ def test_the_two_routes_are_registered() -> None:
 
     assert "/api/v1/signals/held-back/{ticker}" in {r.path for r in signals.router.routes}
     assert "/api/v1/health/model-quota" in {r.path for r in system.router.routes}
+
+
+def test_for_tickers_matches_for_ticker_in_one_pass():
+    # Review F15 (18 Nov): the strip parsed the whole shadow set once per ticker; one pass must give the same lists.
+    import json
+    from shared.utils import held_back as hb
+    raw = [json.dumps({"instrument": t, "family": "x", "reason": "r", "n": i}) for i, t in enumerate(["AAA", "BBB", "AAA", "CCC", "AAA"])] + ["not json"]
+    many = hb.for_tickers(raw, ["aaa", "BBB", "ZZZ"], None, 2)
+    assert many["AAA"] == hb.for_ticker(raw, "AAA", None, 2) and many["BBB"] == hb.for_ticker(raw, "BBB", None, 2) and many["ZZZ"] == []
+    assert len(many["AAA"]) == 2 and "CCC" not in many

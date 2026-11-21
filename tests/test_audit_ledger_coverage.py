@@ -56,6 +56,9 @@ EXEMPT = {
     # A person asks for the bull and bear case on a stock. The POST starts a background
     # job and stores its answer for six hours; it is capped per person and per host, and
     # changes nothing anybody could later dispute.
+    # A person's own price alerts (13 Nov 2026): the levels they watch. Private, per viewer, and a ledger served to admins would expose what
+    # they are watching and at what price. Changes no platform state.
+    "alerts": "a person's own price alerts; private, changes no platform state",
     "stock_thesis": "writes a cached AI answer for one stock; spends capped inference, changes no configuration, access or data",
 }
 

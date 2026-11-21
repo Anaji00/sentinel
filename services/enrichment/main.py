@@ -190,7 +190,7 @@ def apply_display_text(e) -> None:
             e.headline = f"{fd.ticker}{p_str}: market event"
         elif e.crypto_data and e.crypto_data.pair:
             cd = e.crypto_data
-            e.headline = f"{cd.pair} @ ${cd.price:.2f}: crypto market event"
+            e.headline = f"{cd.pair} @ ${(cd.price or 0.0):.2f}: crypto market event"
         elif e.prediction_market_data:
             pm = e.prediction_market_data
             e.headline = f"Prediction market: {pm.question or pm.ticker} ({pm.outcome})"
@@ -211,27 +211,27 @@ def apply_display_text(e) -> None:
         if e.financial_data and e.financial_data.ticker:
             fd = e.financial_data
             p_str = f" @ ${fd.underlying_price:.2f}" if fd.underlying_price else ""
-            vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {fd.volume:,.0f} shares/contracts." if fd.premium_usd else ""
-            e.summary = f"{fd.ticker}{p_str}.{vol_str} Anomaly score: {e.anomaly_score:.2f}."
+            vol_str = f" Notional volume: ${fd.premium_usd/1e6:.2f}M across {(fd.volume or 0):,.0f} shares/contracts." if fd.premium_usd else ""
+            e.summary = f"{fd.ticker}{p_str}.{vol_str} Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         elif e.crypto_data and e.crypto_data.pair:
             cd = e.crypto_data
             fr_str = f" Perpetual funding rate: {cd.funding_rate*100:.4f}%." if cd.funding_rate is not None else ""
-            e.summary = f"{cd.pair} trading @ ${cd.price:.2f}.{fr_str} Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"{cd.pair} trading @ ${(cd.price or 0.0):.2f}.{fr_str} Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         elif e.prediction_market_data:
             pm = e.prediction_market_data
             pm_price = getattr(pm, "price_usd", 0.0) or getattr(pm, "price", 0.0)
-            e.summary = f"Prediction market contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Prediction market contract '{pm.question or pm.market_id}' ({pm.outcome}). Current price/probability: {(pm_price*100):.1f}%. Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         elif e.vessel_data:
             vd = e.vessel_data
-            e.summary = f"Ship position for {vessel_type_label(vd.vessel_type)} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Ship position for {vessel_type_label(vd.vessel_type)} '{ent_name}' (MMSI: {vd.mmsi}) in {e.region or 'International Waters'}. Speed: {vd.speed_knots or 0.0} knots, Heading: {vd.heading or 0}°. Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         elif e.flight_data:
             fl = e.flight_data
-            e.summary = f"Flight position for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f} ft, Ground speed: {_ms_to_kts(fl.velocity_ms):,.0f} knots. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Flight position for aircraft {fl.callsign or ent_name} (ICAO: {fl.icao24}). Altitude: {_m_to_ft(fl.baro_altitude_m or fl.geo_altitude_m):,.0f} ft, Ground speed: {_ms_to_kts(fl.velocity_ms):,.0f} knots. Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         elif e.security_data:
             sec = e.security_data
-            e.summary = f"Security disclosure for {sec.cve_id or ent_name}. Severity: {_cvss_severity(sec.cvss_score)}, Vector: {sec.exposure_type or 'Network'}. Target org: {sec.affected_org or 'Unknown'}. Anomaly score: {e.anomaly_score:.2f}."
+            e.summary = f"Security disclosure for {sec.cve_id or ent_name}. Severity: {_cvss_severity(sec.cvss_score)}, Vector: {sec.exposure_type or 'Network'}. Target org: {sec.affected_org or 'Unknown'}. Anomaly score: {(e.anomaly_score or 0.0):.2f}."
         else:
-            e.summary = f"Event for {ent_name}. Source: {e.source}. Anomaly score: {e.anomaly_score:.2f}. Region: {e.region or 'Global'}."
+            e.summary = f"Event for {ent_name}. Source: {e.source}. Anomaly score: {(e.anomaly_score or 0.0):.2f}. Region: {e.region or 'Global'}."
 
 
 # How often the detectors' recent points are saved. A restart loses at most
@@ -1075,7 +1075,7 @@ async def main():
                         try:
                             apply_display_text(e)
                         except Exception as exc:  # cosmetics must not stop the pipeline
-                            MetricsCollector.increment("pipeline_errors_total:cross_domain_signals")
+                            MetricsCollector.increment("pipeline_errors_total:display_text")
                             logger.warning(
                                 "Display-text formatting failed for event %s: %s",
                                 getattr(e, "event_id", "?"), exc,

@@ -1,0 +1,80 @@
+[
+ {
+  "cell": "G:entry",
+  "n": 452,
+  "clusters": 285,
+  "mean_bps": -282.58,
+  "t": -1.98,
+  "p": 0.04764767463316866,
+  "half1_bps": -192.64,
+  "half2_bps": -372.53,
+  "same_sign": true,
+  "q": 0.0572,
+  "passes": false
+ },
+ {
+  "cell": "G:exit",
+  "n": 416,
+  "clusters": 262,
+  "mean_bps": -312.73,
+  "t": -2.577,
+  "p": 0.009964576369953182,
+  "half1_bps": -204.14,
+  "half2_bps": -421.32,
+  "same_sign": true,
+  "q": 0.0149,
+  "passes": true
+ },
+ {
+  "cell": "Q:entry",
+  "n": 57,
+  "clusters": 55,
+  "mean_bps": -1382.27,
+  "t": -3.758,
+  "p": 0.0001710427352477062,
+  "half1_bps": -771.95,
+  "half2_bps": -1971.55,
+  "same_sign": true,
+  "q": 0.0003,
+  "passes": false
+ },
+ {
+  "cell": "Q:exit",
+  "n": 56,
+  "clusters": 53,
+  "mean_bps": -281.5,
+  "t": -1.116,
+  "p": 0.2644347369570801,
+  "half1_bps": -278.54,
+  "half2_bps": -284.45,
+  "same_sign": true,
+  "q": 0.2644,
+  "passes": false
+ },
+ {
+  "cell": "S:entry",
+  "n": 991,
+  "clusters": 415,
+  "mean_bps": -1304.97,
+  "t": -9.901,
+  "p": 0.0,
+  "half1_bps": -1120.93,
+  "half2_bps": -1488.65,
+  "same_sign": true,
+  "q": 0.0,
+  "passes": true
+ },
+ {
+  "cell": "S:exit",
+  "n": 982,
+  "clusters": 415,
+  "mean_bps": -748.42,
+  "t": -6.793,
+  "p": 1.098943158694965e-11,
+  "half1_bps": -521.14,
+  "half2_bps": -975.69,
+  "same_sign": true,
+  "q": 0.0,
+  "passes": true
+ }
+]

@@ -288,9 +288,11 @@ async def stream_binance_funding_rates(producer: SentinelProducer, redis_client)
                     index_price = float(data.get("i", "0"))
                     next_funding_time = int(data.get("T", 0))
                 except (ValueError, TypeError):
+                    _collector_metrics("collector-crypto").rejected("markprice_unparseable")
                     continue
 
                 if mark_price <= 0 or index_price <= 0:
+                    _collector_metrics("collector-crypto").rejected("markprice_non_positive")
                     continue
 
                 basis_bps = ((mark_price - index_price) / index_price) * 10_000.0
@@ -998,6 +1000,7 @@ async def stream_cross_exchange_divergence(producer: SentinelProducer, redis_cli
         # a pair to compare. Ask again a few times a day rather than every minute.
         if venue_refused:
             dropped("collector_crypto.divergence", "venue_geo_blocked", logger)
+            _collector_metrics("collector-crypto").upstream_error("divergence_venues")
         await asyncio.sleep(VENUE_REFUSED_RETRY_SEC if venue_refused else 60)
 
 

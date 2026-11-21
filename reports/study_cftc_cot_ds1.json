@@ -1,0 +1,80 @@
+[
+ {
+  "cell": "energy:crowded_long",
+  "n": 227,
+  "clusters": 208,
+  "mean_bps": -122.74,
+  "t": -3.13,
+  "p": 0.001745620192812325,
+  "half1_bps": -296.53,
+  "half2_bps": 49.54,
+  "same_sign": false,
+  "q": 0.0105,
+  "passes": false
+ },
+ {
+  "cell": "energy:crowded_short",
+  "n": 295,
+  "clusters": 259,
+  "mean_bps": 35.27,
+  "t": 1.088,
+  "p": 0.2764862870439704,
+  "half1_bps": -166.36,
+  "half2_bps": 235.54,
+  "same_sign": false,
+  "q": 0.4147,
+  "passes": false
+ },
+ {
+  "cell": "grains:crowded_long",
+  "n": 389,
+  "clusters": 266,
+  "mean_bps": -7.58,
+  "t": 0.101,
+  "p": 0.9192315252293193,
+  "half1_bps": 191.67,
+  "half2_bps": -205.81,
+  "same_sign": false,
+  "q": 0.9192,
+  "passes": false
+ },
+ {
+  "cell": "grains:crowded_short",
+  "n": 549,
+  "clusters": 358,
+  "mean_bps": 49.6,
+  "t": 1.576,
+  "p": 0.11504531516477723,
+  "half1_bps": 322.55,
+  "half2_bps": -222.36,
+  "same_sign": false,
+  "q": 0.3451,
+  "passes": false
+ },
+ {
+  "cell": "metals:crowded_long",
+  "n": 413,
+  "clusters": 311,
+  "mean_bps": 6.46,
+  "t": 1.259,
+  "p": 0.20798248076131975,
+  "half1_bps": -23.57,
+  "half2_bps": 36.36,
+  "same_sign": false,
+  "q": 0.4147,
+  "passes": false
+ },
+ {
+  "cell": "metals:crowded_short",
+  "n": 418,
+  "clusters": 272,
+  "mean_bps": 0.29,
+  "t": 0.742,
+  "p": 0.45787412162185603,
+  "half1_bps": -34.08,
+  "half2_bps": 34.66,
+  "same_sign": false,
+  "q": 0.5494,
+  "passes": false
+ }
+]

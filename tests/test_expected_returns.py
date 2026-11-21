@@ -82,3 +82,22 @@ def test_the_lab_measures_knots_over_fixed_percentile_buckets() -> None:
     assert len(cal["knots_bps"]) == len(er.KNOT_EDGES) - 1
     assert sum(k[2] for k in cal["knots_bps"]) == 5000
     assert abs(er.calibrated(0.01, "monthly", cal) - (0.01 + 0.5 * cal["intercept"])) < 0.002
+
+
+def test_a_flat_stretch_of_the_measured_map_is_flagged():
+    """Every monthly long above +55 bps raw read +32.5 bps (13 Nov 2026): the isotonic pooling made the top of the map one value."""
+    from shared.utils import expected_returns as er
+    cal = {"intercept": -0.0087, "slope": 2.0, "knots_bps": [[-435.8, -1241.4, 975], [-176.2, -549.8, 975], [-77.2, -188.9, 7804],
+           [-31.5, -97.6, 9754], [-16.1, -97.3, 9755], [-7.7, -101.3, 9754], [-2.0, -95.6, 9755], [2.0, -69.6, 9754], [7.5, -73.4, 9754],
+           [15.3, -54.5, 9755], [27.7, -57.6, 9754], [55.3, -8.8, 7804], [104.6, 3.2, 975], [173.6, -43.6, 976]]}
+    assert er.on_plateau(0.012, cal) is True and er.on_plateau(0.05, cal) is True        # +120 and +500 bps raw: the flat top
+    assert er.on_plateau(-0.0025, cal) is True                                           # the flat low-middle
+    assert er.on_plateau(-0.0200, cal) is False                                          # a sloped part of the map
+    assert er.on_plateau(None, cal) is None and er.on_plateau(0.01, None) is None and er.on_plateau(0.01, {"knots_bps": []}) is None
+
+
+def test_two_pooled_knots_are_a_plateau():
+    """APP, CORZ and TWLO read 86.2 bps with different raw alphas while the flag was false (20 Nov 2026): a flat two-knot stretch counts."""
+    cal = {"knots_bps": [[-100.0, -20.0], [0.0, 10.0], [60.0, 86.2], [90.0, 86.2], [200.0, 120.0], [300.0, 150.0]]}
+    assert er.on_plateau(0.0075, cal) is True
+    assert er.on_plateau(0.0, cal) is False

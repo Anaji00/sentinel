@@ -63,6 +63,21 @@ def _work_impediment(meta) -> Optional[str]:
     return None
 
 
+HUNG_DISPATCH_SECONDS = 900.0
+
+
+def stall_seconds(idle_seconds: float, lag: Any, oldest_dispatch_seconds: float = 0.0) -> float:
+    """Seconds a consumer has been stalled: idle with unread messages behind it, or a handler that has run longer than HUNG_DISPATCH_SECONDS.
+    Idle with none unread is a sparse subscription, not a stall (0.0), but a hung handler is one even at lag 0 (the lag is 0 because the message was read).
+    An unmeasured lag (None or not a number) keeps the old reading, so a failed lag read never hides a stall."""
+    if isinstance(lag, bool) or not isinstance(lag, (int, float)):
+        idle = float(idle_seconds)
+    else:
+        idle = float(idle_seconds) if lag > 0 else 0.0
+    hung = float(oldest_dispatch_seconds) if float(oldest_dispatch_seconds) > HUNG_DISPATCH_SECONDS else 0.0
+    return max(idle, hung)
+
+
 async def touch_heartbeat(redis_client: Any, component: str, ttl: int = 120, metadata: Optional[dict] = None) -> bool:
     """
     Touches the heartbeat key in Redis for a specific component.

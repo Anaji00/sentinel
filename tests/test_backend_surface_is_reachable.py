@@ -29,6 +29,27 @@ FRONTEND = ROOT / "frontend" / "src"
 
 # Reached by something other than a browser, each with the reason.
 NOT_A_UI_SURFACE = {
+    # Built 12 Nov 2026 at the frontend session's request; the screens switch to them as they ship.
+    "/api/v1/quotes",
+    "/api/v1/predictions/track-record/slice",
+    "/api/v1/portfolio/summary",
+    "/api/v1/stocks/{ticker}/snapshot",
+    "/api/v1/stocks/screener",
+    "/api/v1/health/redis",
+    "/api/v1/health/latency",
+    "/api/v1/health/correlation-funnel",
+    "/api/v1/changes",
+    "/api/v1/feed",
+    "/api/v1/stocks/strip",
+    "/api/v1/market/breadth",
+    "/api/v1/market/heatmap",
+    "/api/v1/calendar/earnings",
+    "/api/v1/stocks/{ticker}/evidence",
+    # Price alerts (13 Nov 2026): in-app and browser delivery; the frontend session wires the bell and the Notification API.
+    "/api/v1/alerts",
+    "/api/v1/alerts/triggered",
+    "/api/v1/alerts/{alert_id}/ack",
+    "/api/v1/alerts/{alert_id}",
     # Scenario requests (29 Oct 2026): API first; the dashboard form to request one
     # and poll its status is not built yet.
     "/api/v1/scenarios/request",
@@ -36,6 +57,10 @@ NOT_A_UI_SURFACE = {
     # The book's exposure lens (31 Oct 2026): read by people and agents through
     # the API until a dashboard panel shows it.
     "/api/v1/portfolio/exposure",
+    # B1 book exposure (19 Nov 2026, quant report T7): read by people and the daily review through the API until a dashboard panel shows it.
+    "/api/v1/portfolio/b1-exposure",
+    # Batch of recent closes for table trend lines (19 Nov 2026), built at the frontend session's request; the Scan table switches to it as it ships.
+    "/api/v1/stocks/closes",
     # Oil-flow indices (31 Oct 2026): API first, for people and the agents,
     # until the chokepoint panel charts them.
     "/api/v1/chokepoints/flows",

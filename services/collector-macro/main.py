@@ -348,10 +348,15 @@ async def fetch_yfinance_single(ticker: str) -> dict:
         try:
             import yfinance as yf
             t = yf.Ticker(ticker)
-            fi = getattr(t, 'fast_info', {})
             p = 0.0
-            if isinstance(fi, dict) or hasattr(fi, '__getitem__'):
-                p = float(fi.get('lastPrice') or fi.get('last_price') or fi.get('previousClose') or 0.0)
+            try:
+                # Its own guard: yfinance raises KeyError 'currentTradingPeriod' inside fast_info for some symbols, and that used to skip the history fallback below.
+                fi = getattr(t, 'fast_info', {})
+                if isinstance(fi, dict) or hasattr(fi, '__getitem__'):
+                    p = float(fi.get('lastPrice') or fi.get('last_price') or fi.get('previousClose') or 0.0)
+            except Exception as _fast_exc:
+                swallowed("collector_macro._sync_yf.fast_info", _fast_exc, logger, detail=str(ticker))
+                p = 0.0
             if p <= 0:
                 df = t.history(period="2d")
                 if not df.empty and "Close" in df.columns:
@@ -828,7 +833,9 @@ async def _first_release_loop() -> None:
     import fred_releases as fred
     from datetime import date as _date
     from shared.db import get_timescale
+    from shared.utils.retry_sleep import next_delay
 
+    failures = 0
     while True:
         try:
             if fred.FRED_API_KEY:
@@ -861,9 +868,12 @@ async def _first_release_loop() -> None:
                             await db.execute_many(_FIRST_RELEASE_SQL, rows)
                         await asyncio.sleep(1)
                 logger.info("First-release macro values refreshed for %s series.", len(fred.FRED_SERIES) - 1)
+            failures = 0
         except Exception as e:
+            failures += 1
             swallowed("collector_macro.first_release", e, logger)
-        await asyncio.sleep(FIRST_RELEASE_INTERVAL_SEC)
+        # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, FIRST_RELEASE_INTERVAL_SEC))
 
 
 async def _eia_loop() -> None:
@@ -871,7 +881,9 @@ async def _eia_loop() -> None:
     shared/utils/eia.py). Published Wednesdays; every six hours catches it."""
     from shared.db import get_timescale
     from shared.utils import eia
+    from shared.utils.retry_sleep import next_delay
 
+    failures = 0
     while True:
         try:
             db = await get_timescale()
@@ -887,9 +899,12 @@ async def _eia_loop() -> None:
                         await db.execute_many(_EIA_UPSERT_SQL, [(name, d, v) for d, v in rows])
                     await asyncio.sleep(2)
             logger.info("EIA weekly stocks refreshed for %s series.", len(eia.SERIES))
+            failures = 0
         except Exception as e:
+            failures += 1
             swallowed("collector_macro.eia", e, logger)
-        await asyncio.sleep(EIA_INTERVAL_SEC)
+        # A failed pass retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, EIA_INTERVAL_SEC))
 
 
 async def main():
@@ -997,6 +1012,8 @@ async def main():
     first_release_task = safe_create_task(_first_release_loop(), name="first-release")
     calendar_task = safe_create_task(_calendar_polling_loop())
     reg_task = safe_create_task(_regulatory_polling_loop())
+    # Free datasets stored for measurement only (CFTC COT, Treasury auctions, Reg SHO list); none feeds an alert.
+    dataset_tasks = [safe_create_task(_load_sibling(m).run_forever(), name=m) for m in ("cftc_cot", "treasury_auctions", "reg_sho")]
 
     try:
         while True:
@@ -1015,6 +1032,8 @@ async def main():
         first_release_task.cancel()
         calendar_task.cancel()
         reg_task.cancel()
+        for t in dataset_tasks:
+            t.cancel()
         await calendar_collector.close()
         await producer.flush()
         await producer.close()

@@ -19,7 +19,9 @@ import hashlib
 import json
 import logging
 
+from shared.utils import filing_time
 from shared.utils.filings_keys import PROMINENT_CIKS_KEY
+from shared.utils.sec_rate import sec_slot
 import os
 import sys
 import time
@@ -375,6 +377,7 @@ async def poll_company_filings(
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
     new_count = 0
 
+    await sec_slot()
     try:
         async with session.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
@@ -389,6 +392,7 @@ async def poll_company_filings(
         report_dates = recent.get("reportDate", [])
         primary_docs = recent.get("primaryDocument", [])
         items_list = recent.get("items", [])
+        accepted_list = recent.get("acceptanceDateTime", [])
 
         # Evaluate last 15 filings
         # The latest fifteen filings that are not 424B2, rather than the latest
@@ -438,10 +442,14 @@ async def poll_company_filings(
             else:
                 summary = f"Periodic SEC filing Form {form} for {company_name} ({ticker}) on {f_date}."
 
+            # The SEC's acceptance time, so latency is measurable and a filing collected late does not look new.
+            accepted_raw = accepted_list[i] if i < len(accepted_list) else None
+            stamped_at, used_acceptance = filing_time.occurred_at(accepted_raw, datetime.now(timezone.utc))
             event = RawEvent(
                 source="sec_edgar",
-                occurred_at=datetime.now(timezone.utc),
+                occurred_at=stamped_at,
                 raw_payload={
+                    "acceptance_time": accepted_raw if used_acceptance else None,
                     "ticker": ticker,
                     "cik": cik,
                     "company_name": company_name,

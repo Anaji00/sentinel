@@ -28,6 +28,21 @@ DATA_URL = "https://data.alpaca.markets"     # market data; the same keys, paper
 _SYMBOL = re.compile(r"^[A-Z][A-Z.]{0,6}$")
 
 
+MAX_TRADE_AGE_SEC = 30 * 60
+
+
+def trade_is_fresh(stamp: object, max_age_sec: float, now: Optional[datetime] = None) -> bool:
+    """True when a trade's ISO time is within `max_age_sec` of now; an unreadable or missing time is not fresh."""
+    if not stamp:
+        return False
+    try:
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    return 0.0 <= ((now or datetime.now(timezone.utc)) - t).total_seconds() <= max_age_sec + 5.0
+
+
 class AlpacaBroker(BrokerInterface):
     """
     Alpaca Markets REST API v2 brokerage adapter.
@@ -118,14 +133,17 @@ class AlpacaBroker(BrokerInterface):
                             )
                         )
                     return positions
-                else:
-                    return []
+                # A failed call is not an empty account: returning [] made the trader believe it held nothing and re-open the whole book
+                # (senior review F1, 18 Nov 2026). The trader refuses to trade on this; the dashboard routes already catch it.
+                raise RuntimeError(f"Alpaca positions request failed: HTTP {resp.status}")
 
-    async def latest_prices(self, symbols: List[str], feed: str = "iex") -> Dict[str, float]:
+    async def latest_prices(self, symbols: List[str], feed: str = "iex", max_age_sec: float = MAX_TRADE_AGE_SEC) -> Dict[str, float]:
         """The latest trade per symbol from the market-data API ({} on failure).
 
         IEX by default: the free plan serves it in real time, and SIP only once
-        it is 15 minutes old. A reference for a limit price, not a mark."""
+        it is 15 minutes old. A reference for a limit price, not a mark. A trade older than `max_age_sec` (or with no readable time) is left
+        out: a thin name's last IEX print can be days old, and a limit built on it after a gap never fills (review F11). The caller then
+        uses the venue's own mark or sends at market, bounded by the liquidity cap."""
         if not self.api_key or not self.secret_key or not symbols:
             return {}
         out: Dict[str, float] = {}
@@ -138,7 +156,7 @@ class AlpacaBroker(BrokerInterface):
                     return False
                 for s, t in ((await resp.json()).get("trades") or {}).items():
                     p = float((t or {}).get("p") or 0.0)
-                    if p > 0:
+                    if p > 0 and trade_is_fresh((t or {}).get("t"), max_age_sec):
                         out[s.upper()] = p
                 return True
 

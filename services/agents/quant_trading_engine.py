@@ -307,6 +307,7 @@ class FinancialAdviceBrief(BaseModel):
 from shared.utils.quant_calc import compute_ta_indicators  # noqa: F401  (moved to the shared quant module; re-exported for existing callers)
 from shared.utils.watchlists import WATCHED_EQUITIES_KEY
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.insider_clusters import distinct_trades
 from shared.utils import tradable_cells
 from shared.utils.rates import risk_free_rate
 
@@ -2462,6 +2463,13 @@ MEASURED SIZING INPUTS:
                     all_trades.append(json.loads(val))
                 except Exception as _exc:
                     swallowed("agents.quant_trading_engine._process_insider_form4", _exc, logger)
+
+            # A transaction that arrived twice is one transaction: the stored copies carry their own timestamps, and counting both doubled its dollars
+            # (8 of 58 live clusters on 20 Nov fell under $250,000 once the repeats were collapsed). The earliest arrival is kept.
+            all_trades, repeated = distinct_trades(all_trades)
+            if repeated:
+                dropped("agents.quant_trading_engine.insider_repeat_line", "a Form 4 transaction that arrived twice was counted once", logger,
+                        detail=f"{ticker} {repeated}")
 
             # 3. Evaluate cluster conditions
             buy_trades = [t for t in all_trades if t.get("tx_type") == "BUY"]

@@ -25,6 +25,7 @@ import numpy as np
 
 from shared.kafka import SentinelProducer, Topics
 from shared.models.ontology import is_valid_predicate
+from shared.utils.edge_proposals import stamp_replication
 from shared.utils.residual_corr import is_market_beta_pair
 from shared.utils import quant_calc
 from shared.utils.feature_flags import FeatureFlagManager
@@ -892,7 +893,7 @@ class StatisticalDiscoveryEngine:
         survives (retest_due_edges); an edge that already replicated is
         refreshed at once. True when sent now."""
         if await self.survival.is_replicated(edge_id):
-            await self.producer.send(topic, proposal, key=key)
+            await self.producer.send(topic, stamp_replication(proposal, int(time.time() * 1000)), key=key)
             return True
         await self.survival.hold(edge_id, proposal, key)
         return False
@@ -946,7 +947,13 @@ class StatisticalDiscoveryEngine:
                 if getattr(verdict, "survived", False):
                     survived += 1
                     if held and self.producer:
-                        await self.producer.send(Topics.ONTOLOGY_PROPOSALS, held["proposal"], key=held.get("key"))
+                        if reg.method == "pearson" and is_market_beta_pair(reg.source, reg.target):
+                            # Held before the beta-link skip existed, or by a path that never checked: released at the hourly retest it
+                            # published QQQ-VXX, SPY-TSLA and others (7 on 12 Nov). The Granger lead-lag edge is not affected.
+                            dropped("correlation.statistical_discovery.market_beta_link", "held correlation with a broad-market index is the "
+                                    "market factor, not a link", logger, detail=f"{reg.source} {reg.target} (released at retest)")
+                        else:
+                            await self.producer.send(Topics.ONTOLOGY_PROPOSALS, stamp_replication(held["proposal"], int(time.time() * 1000)), key=held.get("key"))
                 else:
                     failed += 1
             except Exception as e:

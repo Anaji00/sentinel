@@ -191,7 +191,9 @@ class CustomerLinksJob:
                 "action": "LINK_ENTITY",
                 "data": {"target_id": customer, "source_label": "Company", "target_label": "Company",
                          "relation_type": "SUPPLIER_TO", "confidence": 1.0, "method": "10-K Item 101",
-                         "revenue_pct": pct, "filed": str(filed)},
+                         "revenue_pct": pct, "filed": str(filed),
+                         # The supervisor keeps scalar `properties` on the edge; the flat keys above were dropped.
+                         "properties": {"source": "customer_links", "method": "10-K Item 101", "revenue_pct": pct, "filed": str(filed)}},
             }, key=supplier)
         except Exception as e:
             swallowed("agents.customer_links.propose", e, logger)

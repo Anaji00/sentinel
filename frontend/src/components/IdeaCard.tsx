@@ -6,6 +6,10 @@
  * readable at a glance; the full reasoning one click away.
  */
 
+import { barLabel } from '../lib/candles';
+import useSWR from 'swr';
+import { fetcher } from '../lib/api';
+import { sliceHorizon, trackLine, type TrackSlice } from '../lib/liveFigures';
 import React, { useState } from 'react';
 import { Button } from './ui/Button';
 import { ABSENT, directionMark, formatNumber } from '../lib/format';
@@ -57,6 +61,7 @@ export function IdeaCard({
   horizonLabel,
   fallbackBps = null,
   compact = false,
+  plateau = false,
 }: {
   idea: Idea;
   days: number;
@@ -64,24 +69,25 @@ export function IdeaCard({
   horizonLabel?: string;
   fallbackBps?: number | null;
   compact?: boolean;
+  /** The expected move is shared by many ideas, so it says nothing about this stock and is not shown as a forecast. */
+  plateau?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const long = i.direction > 0;
-  const move = expectedMove(i, fallbackBps);
-  const odds = rightWayOdds(i);
+  // The same few slices serve every card, so SWR shares one request per horizon and direction.
+  const slice = useSWR<TrackSlice>(`/predictions/track-record/slice?horizon=${sliceHorizon(days)}&direction=${i.direction > 0 ? 'long' : 'short'}`, fetcher, { revalidateOnFocus: false });
+  const track = trackLine(slice.data, (iso) => barLabel(`${iso.slice(0, 10)}T00:00:00Z`, '1d'));
+  const move = plateau ? null : expectedMove(i, fallbackBps);
+  const odds = plateau ? null : rightWayOdds(i);
   const f = i.forecast;
   const sized = (f?.stock_weight ?? 0) > 0;
   const o = i.option;
   return (
     <article
       className={`lift wash group relative flex flex-col gap-3 overflow-hidden rounded-md border bg-raised p-4 hover:border-line-accent ${
-        long ? 'border-positive/25 text-positive' : 'border-negative/25 text-negative'
+        long ? 'border-line text-positive' : 'border-line text-negative'
       }`}
     >
-      <div
-        className={`absolute inset-x-0 top-0 h-[3px] ${long ? 'bg-positive' : 'bg-negative'}`}
-        aria-hidden
-      />
       <header className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -101,7 +107,8 @@ export function IdeaCard({
             {i.price != null ? `$${formatNumber(i.price, { decimals: 2 })}` : ABSENT}{' '}
             {i.change_pct != null && (
               <span className={i.change_pct >= 0 ? 'text-positive' : 'text-negative'}>
-                {pct(i.change_pct, 2)} today
+                {pct(i.change_pct, 2)}{' '}
+                {i.change_pct_base_date ? `since the ${barLabel(`${i.change_pct_base_date}T00:00:00Z`, '1d')} close` : 'since an earlier close'}
               </span>
             )}
           </div>
@@ -122,18 +129,30 @@ export function IdeaCard({
 
       <div className="flex items-end justify-between gap-3">
         <div>
-          <div
-            className={`text-display font-semibold leading-none font-mono ${
-              move == null ? 'text-ink-mute' : move >= 0 ? 'text-positive' : 'text-negative'
-            }`}
-          >
-            {pct(move)}
-          </div>
-          <div className="mt-1 text-micro text-ink-mute">
-            {`${move == null || move >= 0 ? 'better' : 'worse'} than the S&P 500 over the next ${
-              days === 1 ? 'day' : `${days} trading days`
-            }`}
-          </div>
+          {plateau ? (
+            <div className="max-w-[16rem] space-y-1">
+              <div className="text-sm font-semibold text-ink">No forecast for this stock</div>
+              <p className="text-micro text-ink-mute">
+                Many top ideas get the same expected move, so it says nothing about this one. The model&apos;s highest ranks have not yet been shown to earn more than its middle ranks.
+              </p>
+            </div>
+          ) : (
+            <>
+          <div className="mb-1 text-micro text-ink-mute">Model expects</div>
+            <div
+              className={`text-2xl font-semibold leading-none font-mono ${
+                move == null ? 'text-ink-mute' : move >= 0 ? 'text-positive' : 'text-negative'
+              }`}
+            >
+              {pct(move)}
+            </div>
+            <div className="mt-1 text-micro text-ink-mute">
+              {`${move == null || move >= 0 ? 'better' : 'worse'} than the S&P 500 over the next ${
+                days === 1 ? 'day' : `${days} trading days`
+              }`}
+            </div>
+            </>
+          )}
         </div>
         <Sparkline
           values={i.spark}
@@ -142,6 +161,11 @@ export function IdeaCard({
           label={`${i.ticker}, last quarter`}
         />
       </div>
+      {track && (
+        <p className="text-micro text-ink-mute" title={track.detail}>
+          {track.headline}
+        </p>
+      )}
 
       <ConvictionMeter p={odds} />
 

@@ -13,6 +13,7 @@ import { ABSENT, formatAge, formatNumber } from '../lib/format';
 import { POLL } from './ui/DataProvider';
 import { LoadingLines } from './ui/Skeleton';
 import { HIT_RATE_CAUTION, TOO_FEW, skillLine, tooFewToGrade, type SkillFields } from '../lib/trackWords';
+import { agentHeadline, agentLabel, agentVerdict, betaAgentRows, datesNote, familyRows, familyVerdict, horizonHoursWords, type Clustered, type Tone } from '../lib/grades';
 
 interface Summary extends SkillFields {
   n: number;
@@ -71,11 +72,9 @@ function Row({ label, s }: { label: string; s?: Summary }) {
       </td>
       <td
         className="text-right font-mono"
-        title={s?.t_days !== undefined ? `Counted per day over ${s.days ?? 0} days; per stock-day it would read ${s.t ?? ABSENT}` : undefined}
+        title={s?.t_days != null ? `Counted one result per day over ${s.days ?? 0} days. Counting every call as independent would overstate it.` : 'Not counted per day, so no figure is shown: counting every call as independent would overstate it.'}
       >
-        {(s?.t_days !== undefined ? s.t_days : s?.t) != null
-          ? formatNumber((s?.t_days !== undefined ? s.t_days : s?.t) as number, { decimals: 2 })
-          : ABSENT}
+        {s?.t_days != null ? formatNumber(s.t_days, { decimals: 2 }) : ABSENT}
       </td>
         </>
       )}
@@ -90,7 +89,7 @@ const Head = ({ first, mean }: { first: string; mean: string }) => (
       <th className="text-right">Calls</th>
       <th className="text-right" title="Share of calls that beat the S&P 500. Chance alone would give about half, so read it beside that, not on its own.">Right (chance: about half)</th>
       <th className="text-right">{mean}</th>
-      <th className="text-right" title="t-statistic: above 2 means unlikely to be luck">Not luck?</th>
+      <th className="text-right" title="t-statistic counted one result per day: above 2 is unlikely to be luck. Shown only when it is counted per day.">Not luck?</th>
     </tr>
   </thead>
 );
@@ -223,73 +222,75 @@ export function PaperLedger() {
           <p className="text-micro text-ink-mute">
             Open now: {data.open}; waiting for their first session: {data.pending}.
           </p>
-          <table className="w-full">
-            <thead className="text-ink-mute">
-              <tr className="border-b border-line">
-                <th className="py-1 text-left">Closed trades</th>
-                <th className="text-right">Trades</th>
-                <th className="text-right">Won</th>
-                <th className="text-right">Average, after costs</th>
-                <th className="text-right">Before costs</th>
-                <th className="text-right">Cost each way</th>
-                <th className="text-right">Stopped</th>
-                <th className="text-right" title="Trades still open, valued at the latest close as if sold there">
-                  Still open
-                </th>
-                <th className="text-right" title="Closed and open trades together: the fair read while a horizon is young">
-                  All, incl. open
-                </th>
-                <th className="text-right">P&amp;L</th>
-                <th className="text-right" title="Each trade sized up when markets are calm and down when they are volatile">
-                  P&amp;L, sized by risk
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {['daily', 'weekly', 'monthly', 'events', 'all'].map((h) => {
-                const r = data.by_horizon[h];
-                return (
-                  <tr key={h} className="border-b border-line/60">
-                    <td className="py-0.5 text-ink-dim">{h}</td>
-                    <td className="text-right font-mono">{r?.n ?? 0}</td>
-                    <td className="text-right font-mono" title={tooFewToGrade(r?.n) ? TOO_FEW : undefined}>
-                      {tooFewToGrade(r?.n) ? <span className="text-micro text-ink-mute">too few</span> : r?.hit_rate != null ? `${formatNumber(r.hit_rate * 100, { decimals: 0 })}%` : ABSENT}
-                    </td>
-                    <td
-                      className={`text-right font-mono ${
-                        r?.mean_bps == null ? '' : r.mean_bps > 0 ? 'text-positive' : 'text-negative'
-                      }`}
-                    >
-                      {r?.mean_bps != null ? `${formatNumber(r.mean_bps / 100, { decimals: 2 })}%` : ABSENT}
-                    </td>
-                    <td className="text-right font-mono">
-                      {r?.gross?.mean_bps != null ? `${formatNumber(r.gross.mean_bps / 100, { decimals: 2 })}%` : ABSENT}
-                    </td>
-                    <td className="text-right font-mono">
-                      {r?.mean_cost_bps != null ? `${formatNumber(r.mean_cost_bps / 100, { decimals: 2 })}%` : ABSENT}
-                    </td>
-                    <td className="text-right font-mono">{r?.stopped ?? 0}</td>
-                    <td className="text-right font-mono" title={`Average ${pct(r?.open_marked?.mean_bps)}`}>
-                      {r?.open_marked?.n ?? 0}
-                    </td>
-                    <td
-                      className={`text-right font-mono ${
-                        r?.with_open?.mean_bps == null ? '' : r.with_open.mean_bps > 0 ? 'text-positive' : 'text-negative'
-                      }`}
-                    >
-                      {pct(r?.with_open?.mean_bps)}
-                    </td>
-                    <td className={`text-right font-mono ${!r ? '' : r.pnl_usd >= 0 ? 'text-positive' : 'text-negative'}`}>
-                      {r ? `$${formatNumber(r.pnl_usd, { decimals: 0 })}` : ABSENT}
-                    </td>
-                    <td className={`text-right font-mono ${!r ? '' : r.pnl_scaled_usd >= 0 ? 'text-positive' : 'text-negative'}`}>
-                      {r ? `$${formatNumber(r.pnl_scaled_usd, { decimals: 0 })}` : ABSENT}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="text-ink-mute">
+                <tr className="border-b border-line">
+                  <th className="py-1 text-left">Closed trades</th>
+                  <th className="text-right">Trades</th>
+                  <th className="text-right">Won</th>
+                  <th className="text-right">Average, after costs</th>
+                  <th className="text-right">Before costs</th>
+                  <th className="text-right">Cost each way</th>
+                  <th className="text-right">Stopped</th>
+                  <th className="text-right" title="Trades still open, valued at the latest close as if sold there">
+                    Still open
+                  </th>
+                  <th className="text-right" title="Closed and open trades together: the fair read while a horizon is young">
+                    All, incl. open
+                  </th>
+                  <th className="text-right">P&amp;L</th>
+                  <th className="text-right" title="Each trade sized up when markets are calm and down when they are volatile">
+                    P&amp;L, sized by risk
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {['daily', 'weekly', 'monthly', 'events', 'all'].map((h) => {
+                  const r = data.by_horizon[h];
+                  return (
+                    <tr key={h} className="border-b border-line/60">
+                      <td className="py-0.5 text-ink-dim">{h}</td>
+                      <td className="text-right font-mono">{r?.n ?? 0}</td>
+                      <td className="text-right font-mono" title={tooFewToGrade(r?.n) ? TOO_FEW : undefined}>
+                        {tooFewToGrade(r?.n) ? <span className="text-micro text-ink-mute">too few</span> : r?.hit_rate != null ? `${formatNumber(r.hit_rate * 100, { decimals: 0 })}%` : ABSENT}
+                      </td>
+                      <td
+                        className={`text-right font-mono ${
+                          r?.mean_bps == null ? '' : r.mean_bps > 0 ? 'text-positive' : 'text-negative'
+                        }`}
+                      >
+                        {r?.mean_bps != null ? `${formatNumber(r.mean_bps / 100, { decimals: 2 })}%` : ABSENT}
+                      </td>
+                      <td className="text-right font-mono">
+                        {r?.gross?.mean_bps != null ? `${formatNumber(r.gross.mean_bps / 100, { decimals: 2 })}%` : ABSENT}
+                      </td>
+                      <td className="text-right font-mono">
+                        {r?.mean_cost_bps != null ? `${formatNumber(r.mean_cost_bps / 100, { decimals: 2 })}%` : ABSENT}
+                      </td>
+                      <td className="text-right font-mono">{r?.stopped ?? 0}</td>
+                      <td className="text-right font-mono" title={`Average ${pct(r?.open_marked?.mean_bps)}`}>
+                        {r?.open_marked?.n ?? 0}
+                      </td>
+                      <td
+                        className={`text-right font-mono ${
+                          r?.with_open?.mean_bps == null ? '' : r.with_open.mean_bps > 0 ? 'text-positive' : 'text-negative'
+                        }`}
+                      >
+                        {pct(r?.with_open?.mean_bps)}
+                      </td>
+                      <td className={`text-right font-mono ${!r ? '' : r.pnl_usd >= 0 ? 'text-positive' : 'text-negative'}`}>
+                        {r ? `$${formatNumber(r.pnl_usd, { decimals: 0 })}` : ABSENT}
+                      </td>
+                      <td className={`text-right font-mono ${!r ? '' : r.pnl_scaled_usd >= 0 ? 'text-positive' : 'text-negative'}`}>
+                        {r ? `$${formatNumber(r.pnl_scaled_usd, { decimals: 0 })}` : ABSENT}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
           {['weekly', 'monthly', 'events']
             .filter((h) => onlyStopsSoFar(data.by_horizon[h]))
             .map((h) => (
@@ -322,6 +323,8 @@ interface Placebo {
 
 interface ProducerGradesData {
   generated_at?: string;
+  /** One unit per family, stock and day, against a random stock the same day; the figures to read. */
+  clustered?: Clustered | null;
   correlations_1d?: GradeRow[];
   correlations_5d?: GradeRow[];
   scenarios_5d?: GradeRow[];
@@ -336,6 +339,77 @@ const VERDICT_STYLE: Record<string, string> = {
   'no difference': 'text-ink-dim',
   'too few': 'text-ink-mute',
 };
+
+const TONE_CLASS: Record<Tone, string> = { good: 'text-positive', warn: 'text-caution', plain: 'text-ink-dim', quiet: 'text-ink-mute' };
+
+/** Alert families against a random stock the same day, counted by day so a busy day is not counted many times. */
+function FamilyTable({ clustered }: { clustered: Clustered }) {
+  const rows = familyRows(clustered, 5);
+  return (
+    <table className="w-full">
+      <thead className="text-ink-mute">
+        <tr className="border-b border-line">
+          <th className="py-1 text-left">Alert family, 5 sessions</th>
+          <th className="text-right" title="How many different days the results rest on, and how many cases fell on the three busiest">Days</th>
+          <th className="text-right" title="Extra size of move compared with a random stock on the same day">Extra move</th>
+          <th className="text-right">Against a random stock</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.length === 0 ? (
+          <tr>
+            <td className="py-1 text-ink-mute" colSpan={4}>Not enough graded yet.</td>
+          </tr>
+        ) : (
+          rows.map((r) => {
+            const v = familyVerdict(r.verdict);
+            return (
+              <tr key={r.family} className="border-b border-line/60">
+                <td className="py-0.5 text-ink-dim">{r.family}</td>
+                <td className="text-right font-mono" title={datesNote(r.dates, r.top3_date_share)}>{r.dates ?? ABSENT}</td>
+                <td className="text-right font-mono">{r.excess_over_control != null ? `${r.excess_over_control >= 0 ? '+' : '−'}${formatNumber(Math.abs(r.excess_over_control), { decimals: 2 })}x` : ABSENT}</td>
+                <td className={`text-right ${TONE_CLASS[v.tone]}`}>{v.text}</td>
+              </tr>
+            );
+          })
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+/** Agent calls with the market's own move removed, counted by day. No per-call t is shown. */
+function AgentTable({ clustered }: { clustered: Clustered }) {
+  const rows = betaAgentRows(clustered);
+  if (rows.length === 0) return null;
+  return (
+    <table className="w-full">
+      <thead className="text-ink-mute">
+        <tr className="border-b border-line">
+          <th className="py-1 text-left">AI analyst, after the market&apos;s move</th>
+          <th className="text-right">Calls</th>
+          <th className="text-right" title="Different days the calls were made on">Days</th>
+          <th className="text-right">Average result</th>
+          <th className="text-right">Verdict</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => {
+          const v = agentVerdict(r.verdict);
+          return (
+            <tr key={`${r.agent}-${r.horizon_h}`} className="border-b border-line/60">
+              <td className="py-0.5 text-ink-dim">{agentLabel(r)}, {horizonHoursWords(r.horizon_h)}</td>
+              <td className="text-right font-mono">{r.calls ?? ABSENT}</td>
+              <td className="text-right font-mono" title={datesNote(r.dates, r.top3_date_share)}>{r.dates ?? ABSENT}</td>
+              <td className="text-right font-mono">{r.mean_signed_bps != null ? `${r.mean_signed_bps >= 0 ? '+' : '−'}${formatNumber(Math.abs(r.mean_signed_bps) / 100, { decimals: 2 })}%` : ABSENT}</td>
+              <td className={`text-right ${TONE_CLASS[v.tone]}`}>{v.text}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
 
 function RatioTable({ title, rows }: { title: string; rows?: GradeRow[] }) {
   const shown = (rows ?? []).filter((r) => r.verdict !== 'too few').slice(0, 10);
@@ -390,7 +464,7 @@ export function ProducerGrades() {
         ships and aircraft are compared with simply assuming yesterday&apos;s activity continues.
       </p>
       <p role="note" className="rounded-lg border border-line px-3 py-2 text-micro text-ink-mute">
-        As of 30 Oct 2026 no forecasting agent had beaten chance. {HIT_RATE_CAUTION}
+        {agentHeadline(betaAgentRows(data?.clustered)) ?? 'No forecasting agent has been shown to beat chance.'} {HIT_RATE_CAUTION}
       </p>
       {error ? (
         <p className="text-ink-mute">The grades could not be read.</p>
@@ -400,9 +474,17 @@ export function ProducerGrades() {
         <p className="text-ink-mute">{data.note}</p>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <RatioTable title="Correlation rules, 5 sessions" rows={data.correlations_5d} />
+          {data.clustered?.rows ? (
+            <FamilyTable clustered={data.clustered} />
+          ) : (
+            <div className="space-y-1">
+              <RatioTable title="Correlation rules, 5 sessions" rows={data.correlations_5d} />
+              <p className="text-micro text-ink-mute">Counts every alert as independent, so these verdicts overstate. Read them as a rough guide only.</p>
+            </div>
+          )}
           <div className="space-y-3">
             <RatioTable title="Scenarios by status, 5 sessions" rows={data.scenarios_5d} />
+            {data.clustered?.agents?.rows ? <AgentTable clustered={data.clustered} /> : null}
             <table className="w-full">
               <Head first="AI analyst calls, vs the S&P 500" mean="Average gain" />
               <tbody>

@@ -175,3 +175,20 @@ def test_grants_do_not_make_a_cluster():
     assert asyncio.run(run()) is None
     stored = [json.loads(k) for k in agent.redis.z["sentinel:insider:trades:ACME"]]
     assert {t["tx_type"] for t in stored} == {"OTHER"}
+
+
+def test_a_transaction_that_arrives_twice_is_counted_once():
+    # Open item "insert rate gap" (20 Nov): live clusters were over-counted because a re-delivered Form 4 line was stored twice with its own timestamp,
+    # so two buyers of $140,000 each (one line twice) read as $420,000 and fired a cluster the registered rule would not.
+    from shared.utils.insider_clusters import distinct_trades
+    line = {"ticker": "ACME", "insider_name": "JANE ROE", "tx_type": "BUY", "shares": 1000.0, "price": 140.0, "total_usd": 140000.0}
+    other = {"ticker": "ACME", "insider_name": "JOHN DOE", "tx_type": "BUY", "shares": 1000.0, "price": 140.0, "total_usd": 140000.0}
+    rows, repeated = distinct_trades([dict(line, timestamp=3.0), dict(other, timestamp=2.0), dict(line, timestamp=1.0)])
+    assert repeated == 1 and len(rows) == 2 and sum(r["total_usd"] for r in rows) == 280000.0
+    assert [r["timestamp"] for r in rows if r["insider_name"] == "JANE ROE"] == [1.0]          # the earliest arrival is kept
+    assert distinct_trades([]) == ([], 0)
+
+
+def test_the_live_engine_collapses_repeats_before_the_gate():
+    src = open("services/agents/quant_trading_engine.py", encoding="utf-8").read()
+    assert src.index("distinct_trades(all_trades)") < src.index("buy_trades = [t for t in all_trades")

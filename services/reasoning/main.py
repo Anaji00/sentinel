@@ -70,6 +70,7 @@ from shared.utils.backpressure import declare_pressure, clear_pressure
 from shared.utils.rule_feedback import conversion_rates, conversion_weight
 from shared.utils.instrument_reach import cluster_reaches_instrument
 from shared.utils.quiet_failures import dropped, swallowed
+from shared.utils.scenario_initial_state import build_initial_state
 from shared.utils.heartbeat import start_heartbeat_task
 
 def _jsonable(value):
@@ -151,8 +152,8 @@ async def _save_scenario(db, scenario) -> bool:
                 recommended_monitoring, confidence_overall,
                 confidence_rationale, supporting_event_ids,
                 trace_id, narrative_summary,
-                primary_entity_id, primary_entity_name
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::uuid[],$11::uuid,$12,$13,$14)
+                primary_entity_id, primary_entity_name, initial_state
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::uuid[],$11::uuid,$12,$13,$14,$15)
         """, 
             scenario.scenario_id,
             scenario.correlation_id,
@@ -187,6 +188,8 @@ async def _save_scenario(db, scenario) -> bool:
             # the platform has ever produced, including the single-entity ones.
             (scenario.primary_entity_id or None),
             (scenario.primary_entity_name or None),
+            # P6 Phase 0: the generator's own probabilities and confidence, before any tracker update (a dict for the jsonb codec, as with hypotheses above).
+            build_initial_state(scenario.hypotheses, scenario.confidence_overall, scenario.correlation_id),
         )
         logger.info("✅ Intelligence Synthesis Saved: %s", scenario.headline[:80])
         return True

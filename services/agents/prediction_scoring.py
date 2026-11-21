@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextvars import ContextVar
 import logging
 import math
 import os
@@ -100,6 +101,19 @@ def canonical_direction(value) -> Optional[str]:
 
 class _QuoteCacheMiss(Exception):
     """The one-hour quote cache had nothing. Storage is asked next."""
+
+
+# The correlation a handler is working on, so the predictions it records can name their source. Set by the handler per message (a ContextVar, so concurrent messages do not
+# mix); read in record_prediction. 99% of resolved predictions had no correlation_id before this, so no replay could say which correlation produced a call (13 Nov 2026).
+CURRENT_CORRELATION_ID: ContextVar[Optional[str]] = ContextVar("current_correlation_id", default=None)
+
+
+def with_correlation_id(features: Optional[Dict[str, Any]], current: Optional[str]) -> Dict[str, Any]:
+    """The features with the source correlation id added when one is known and the caller did not set it."""
+    out = dict(features or {})
+    if current and "correlation_id" not in out:
+        out["correlation_id"] = str(current)
+    return out
 
 
 class AgentPrediction(BaseModel):
@@ -443,7 +457,7 @@ class PredictionScoringMixin:
                 outcome_space=list(outcome_space or []),
                 predicted_outcome=predicted_outcome,
                 market_key=market_key,
-                features=dict(features or {}),
+                features=with_correlation_id(features, CURRENT_CORRELATION_ID.get()),
             )
             key = f"sentinel:predictions:{self.name}:{pred.prediction_id}"
             # Horizon plus a generous window to be resolved in.
@@ -885,6 +899,17 @@ class PredictionScoringMixin:
                     await self._record_unresolvable(pred)
                     continue        # unverifiable for now, so uncounted
 
+                # P4 (owner-approved 20 Nov 2026): a prediction whose durable row is already resolved moves no scorecard a second time. The
+                # Redis copy can be rewritten unverified after resolution, and the sweep then resolves it again: SR-20261117-001 was persisted
+                # 6 times with outcomes t,t,t,t,f,t, and each pass folded one more outcome into the Brier score, the hit rate and, through
+                # them, the consensus weight and Kelly's win probability.
+                if await self._already_resolved(pred):
+                    dropped(f"agents.{self.name}.re_resolved", "prediction already has a resolved durable row; the scorecard was not updated twice",
+                            self.logger, detail=str(pred.prediction_id))
+                    pred.verified = True
+                    pred.outcome_correct = correct
+                    await self.redis.raw.set(key, pred.model_dump_json(), ex=86400)
+                    continue
                 await self.update_scorecard(
                     prediction_correct=correct,
                     conviction=pred.conviction,
@@ -919,6 +944,21 @@ class PredictionScoringMixin:
             )
         return resolved
 
+    async def _already_resolved(self, pred: "AgentPrediction") -> bool:
+        """True when `agent_predictions` already holds a resolved row for this prediction under this agent's name (the same name the insert writes).
+        An unreadable table is not evidence either way: counted, and the old behaviour (score it) stands."""
+        if not self.db:
+            return False
+        try:
+            name = str(self.name) + (f".{side_label(pred.strategy)}" if side_label(pred.strategy) else "")
+            row = await self.db.query_one(
+                "SELECT 1 AS found FROM agent_predictions WHERE prediction_id = $1 AND agent_name = $2 AND resolved_at IS NOT NULL LIMIT 1",
+                str(pred.prediction_id), name)
+            return bool(row)
+        except Exception as e:
+            swallowed(f"agents.{self.name}._already_resolved", e, self.logger)
+            return False
+
     async def _persist_resolved_prediction(self, pred: "AgentPrediction", correct: bool) -> None:
         """Writes a resolved prediction to the durable record its readers query.
 
@@ -935,8 +975,9 @@ class PredictionScoringMixin:
                 INSERT INTO agent_predictions (
                     prediction_id, predicted_target, confidence, occurred_at,
                     agent_name, ticker, direction, entry_price, horizon_hours,
-                    resolved_at, outcome_correct, brier_score
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11)
+                    resolved_at, outcome_correct, brier_score, correlation_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11, $12)
+                ON CONFLICT DO NOTHING
                 """,
                 str(pred.prediction_id),
                 str(pred.ticker),
@@ -950,6 +991,7 @@ class PredictionScoringMixin:
                 int(pred.time_horizon_hours or 0),
                 bool(correct),
                 round(brier, 6),
+                (str((pred.features or {}).get("correlation_id")) if (pred.features or {}).get("correlation_id") else None),
             )
         except Exception as e:
             # Counted, not whispered. This is the durable record three separate

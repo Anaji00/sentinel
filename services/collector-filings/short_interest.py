@@ -140,8 +140,11 @@ async def run_forever() -> None:
     import aiohttp
     from shared.db import get_timescale
 
+    from shared.utils.retry_sleep import next_delay
+
     await asyncio.sleep(120)
     timeout = aiohttp.ClientTimeout(total=120)
+    failures = 0
     while True:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -149,9 +152,12 @@ async def run_forever() -> None:
                 if stats["settlements"]:
                     logger.info("FINRA short interest: %s new settlements, %s rows",
                                 stats["settlements"], stats["rows"])
+            failures = 0
         except Exception as e:
+            failures += 1
             swallowed("collector_filings.short_interest", e, logger)
-        await asyncio.sleep(TOPUP_INTERVAL_SEC)
+        # A failed top-up retries in 15 minutes, up to four times, instead of waiting the full interval.
+        await asyncio.sleep(next_delay(failures, TOPUP_INTERVAL_SEC))
 
 
 __all__ = ["rows_from", "settlement_dates", "fetch_settlement", "sync", "run_forever"]

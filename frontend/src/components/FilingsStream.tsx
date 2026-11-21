@@ -24,6 +24,7 @@ import { ExportButton } from './ui/ExportButton';
 import { POLL } from './ui/DataProvider';
 import { IconAlert, IconDocument } from './ui/icons';
 import { formatDate, formatNumber } from '../lib/format';
+import { plainForm } from '../lib/plainFiling';
 import type { CsvColumn } from '../lib/csv';
 
 interface Filing {
@@ -31,6 +32,8 @@ interface Filing {
   company_name: string | null;
   form_type: string;
   filing_date: string;
+  /** 'sec' when the filing carries its own date, 'collected' when it is the day the platform stored it. */
+  filing_date_source?: 'sec' | 'collected' | '';
   is_material_8k: boolean;
   items: string[];
   summary: string;
@@ -138,11 +141,15 @@ export default function FilingsStream() {
                   key={`${f.ticker}-${f.form_type}-${f.filing_date}-${i}`}
                   className="border-b border-line/60 hover:bg-overlay"
                 >
-                  <td className="whitespace-nowrap px-3 py-2 font-mono text-ink-mute">
+                  <td
+                    className="whitespace-nowrap px-3 py-2 font-mono text-ink-mute"
+                    title={f.filing_date_source === 'collected' ? 'The day we stored this filing. The filing itself may be dated a day earlier.' : undefined}
+                  >
                     {/* A filing date is a calendar day, sent as midnight UTC. As a
                         clock time it read "20:00" on every row -- the evening
                         before, in Eastern time. */}
-                    {formatDate(f.filing_date)}
+                    {f.filing_date ? formatDate(f.filing_date) : <span className="font-sans text-micro">not recorded</span>}
+                    {f.filing_date_source === 'collected' && <span className="ml-1 font-sans text-micro" aria-hidden>~</span>}
                   </td>
                   <td className="px-3 py-2">
                     <span className="symbol text-accent">{f.ticker ?? '—'}</span>
@@ -156,17 +163,13 @@ export default function FilingsStream() {
                   <td className="px-3 py-2">
                     <span
                       className={`badge ${f.is_material_8k ? 'tone-caution' : 'tone-muted'}`}
-                      title={
-                        f.is_material_8k
-                          ? 'The platform judged this a material 8-K.'
-                          : 'Routine disclosure.'
-                      }
+                      title={`${f.form_type}. ${f.is_material_8k ? 'The platform judged this a material 8-K.' : 'Routine disclosure.'}`}
                     >
                       {f.is_material_8k && <IconAlert />}
-                      {f.form_type}
+                      {plainForm(f.form_type)}
                     </span>
                   </td>
-                  <td className="px-3 py-2 text-ink-dim">
+                  <td className="max-w-md px-3 py-2 text-ink-dim" title={f.summary || undefined}>
                     {/* The document, not a copy of it. The summary is the
                         platform's; the filing is the SEC's, and an analyst
                         acting on one needs the second. */}
@@ -177,7 +180,7 @@ export default function FilingsStream() {
                         rel="noreferrer noopener"
                         className="text-ink-dim underline decoration-line-strong underline-offset-2 hover:text-accent"
                       >
-                        {f.summary}
+                        <span className="line-clamp-2">{f.summary || 'Open the filing'}</span>
                       </a>
                     ) : (
                       f.summary

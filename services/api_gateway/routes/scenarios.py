@@ -38,6 +38,9 @@ from shared.utils.feature_flags import FeatureFlagManager
 from shared.utils import scenario_requests as sr
 from shared.utils.scenario_requests import ScenarioRequest
 from shared.utils.alert_view import divergence_view
+from shared.utils import security_flag as sf
+from shared.utils.producer_grades import rule_family
+from shared.utils.quiet_failures import swallowed
 
 # Client-facing shape of a correlation record. Keeps the response contract
 # independent of the `correlations` table layout.
@@ -57,6 +60,12 @@ CORRELATION_FIELDS = (
     "breadth",
     "beta",
     "relative_volume",
+    "regime",
+    # The primary entity and whether it is a security (a ticker with a recent daily bar): the dashboard links a stock page only when true.
+    "primary_entity_id",
+    "is_security",
+    # The rule's family, spelled exactly as the producer-grades rows name it (shared/utils/producer_grades.rule_family), for the alert-quality badge.
+    "rule_family",
 )
 
 logger = logging.getLogger("api-gateway.scenarios")
@@ -226,14 +235,25 @@ async def get_correlations(
     # 2. Query TimescaleDB correlations table
     try:
         rows = await db.query("""
-            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario, metrics_summary
+            SELECT correlation_id, rule_name, alert_tier, detected_at, description, tags, scenario, metrics_summary, primary_entity_id
             FROM correlations 
             WHERE alert_tier >= $1 
             ORDER BY detected_at DESC LIMIT $2
         """, min_tier, limit)
 
+        with_bars: set = set()
+        try:
+            ids = sf.candidate_ids(r.get("primary_entity_id") for r in rows)
+            if ids:
+                with_bars = {str(b["ticker"]).upper() for b in await db.query(
+                    "SELECT DISTINCT ticker FROM daily_bars WHERE ticker = ANY($1::text[]) AND day >= CURRENT_DATE - $2::int", ids, sf.SESSIONS_WINDOW_DAYS) or []}
+        except Exception as exc:
+            swallowed("api_gateway.correlations.is_security", exc, logger)
+
         for r in rows:
             item = dict(r)
+            item["is_security"] = sf.is_security(item.get("primary_entity_id"), with_bars)
+            item["rule_family"] = rule_family(str(item.get("rule_name") or "")) or None
             scen = item.get("scenario")
             if isinstance(scen, str):
                 try:

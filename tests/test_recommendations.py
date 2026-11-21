@@ -256,3 +256,12 @@ def test_effective_bets_counts_independent_positions() -> None:
     assert rc.effective_bets(same) < 1.2
     assert rc.effective_bets(apart) > 4.5
     assert rc.effective_bets([theme]) == 1.0 and rc.effective_bets([]) is None
+
+
+def test_an_idea_list_takes_at_most_three_a_side_from_one_group():
+    """The 112 graded monthly ideas were one AI-hardware episode (12 of 23 longs); effective n was about 1 (13 Nov 2026)."""
+    from shared.utils import recommendations as rc
+    assert rc.group_is_full(["ai", "ai"], "ai") is False
+    assert rc.group_is_full(["ai", "ai", "ai"], "ai") is True
+    assert rc.group_is_full(["ai", "ai", "ai"], "banks") is False
+    assert rc.group_is_full([None, None, None, None], None) is False              # unknown is not one group

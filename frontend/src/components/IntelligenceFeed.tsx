@@ -2,10 +2,13 @@
 
 import { DivergenceBrief, StageBadge } from './DivergenceBrief';
 import { ZWhisker } from './ui/ZWhisker';
-import { ALERT_KINDS, filterAlerts, type AlertKind, type Brief, type Situation } from '../lib/divergence';
+import { ALERT_KINDS, filterAlerts, foldAlerts, type AlertKind, type Brief, type Situation } from '../lib/divergence';
 import { Button } from './ui/Button';
 import WhatIf from './WhatIf';
 import ScenarioPaths from './ScenarioPaths';
+import { plainEventText, plainSource, unusualWords, withoutStaleConfidence } from '../lib/plainEvent';
+import { directionNote } from '../lib/divergence';
+import { datesNote, familyVerdict, gradeFor, type Clustered } from '../lib/grades';
 import React, { useMemo, useState } from 'react';
 import { Input } from './ui/Input';
 import useSWR from 'swr';
@@ -46,6 +49,8 @@ interface CorrelationCluster {
   detected_at: string;
   description: string;
   tags?: string[];
+  /** The family the grader groups this rule under, matched exactly to the clustered grades. */
+  rule_family?: string | null;
   evidence_trail?: EvidenceContributor[];
   /** Divergence alerts only: where the situation stands, and the seven-section brief. */
   situation?: Situation | null;
@@ -225,19 +230,19 @@ const SCORE_ELEVATED = 0.7;
 const getScoreBadge = (score: number) => {
   if (score >= SCORE_CRITICAL)
     return (
-      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-negative/15 text-negative border border-negative/40">
-        Very unusual {score.toFixed(2)}
+      <span title={`How unusual: ${score.toFixed(2)} on a scale of 0 to 1`} className="px-2 py-0.5 rounded text-micro font-bold bg-negative/15 text-negative border border-negative/40">
+        {unusualWords(score)}
       </span>
     );
   if (score >= SCORE_ELEVATED)
     return (
-      <span className="px-2 py-0.5 rounded text-micro font-mono font-bold bg-caution/10 text-caution border border-caution/30">
-        Unusual {score.toFixed(2)}
+      <span title={`How unusual: ${score.toFixed(2)} on a scale of 0 to 1`} className="px-2 py-0.5 rounded text-micro font-bold bg-caution/10 text-caution border border-caution/30">
+        {unusualWords(score)}
       </span>
     );
   return (
-    <span className="px-2 py-0.5 rounded text-micro font-mono text-ink-mute border border-line">
-      Routine {score.toFixed(2)}
+    <span title={`How unusual: ${score.toFixed(2)} on a scale of 0 to 1`} className="px-2 py-0.5 rounded text-micro text-ink-mute border border-line">
+      {unusualWords(score)}
     </span>
   );
 };
@@ -303,8 +308,8 @@ const NewsToneBadge = ({ reading }: { reading: NewsTone }) => (
 const EventRow = React.memo(
   ({ e, onClick }: { e: NormalizedEvent; onClick: (e: NormalizedEvent) => void }) => {
     const domainMeta = domainMetaFor(e);
-    const sourceName = getCleanSource(e);
-    const title = formatEnglishHeadline(e);
+    const sourceName = plainSource(getCleanSource(e));
+    const title = plainEventText(formatEnglishHeadline(e));
     const entityName = entityLabel(e);
     const newsTone = companyNewsTone(e);
 
@@ -365,7 +370,15 @@ const EventRow = React.memo(
               </span>
             )}
           </div>
-          {newsTone ? <NewsToneBadge reading={newsTone} /> : getScoreBadge(e.anomaly_score)}
+          {newsTone ? (
+            <NewsToneBadge reading={newsTone} />
+          ) : /^SEC Filing/i.test(e.headline || '') ? (
+            <span title="For filings the score says how material the form is, not how unusual the event is." className="px-2 py-0.5 rounded text-micro text-ink-mute border border-line">
+              Filing
+            </span>
+          ) : (
+            getScoreBadge(e.anomaly_score)
+          )}
         </div>
 
         <p className="text-xs text-ink font-sans font-semibold line-clamp-2 group-hover:text-ink transition-colors leading-snug">
@@ -374,7 +387,7 @@ const EventRow = React.memo(
 
         {e.summary && (
           <p className="text-micro text-ink-dim font-sans mt-1 line-clamp-2 leading-tight">
-            {e.summary}
+            {plainEventText(e.summary)}
           </p>
         )}
 
@@ -396,7 +409,8 @@ const EventRow = React.memo(
 );
 EventRow.displayName = 'EventRow';
 
-const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
+const CorrelationCard = React.memo(({ c, others = [], grades }: { c: CorrelationCluster; others?: CorrelationCluster[]; grades?: Clustered | null }) => {
+  const grade = gradeFor(grades, c.rule_family);
   const [showEvidence, setShowEvidence] = useState(false);
   const trail = c.evidence_trail || [];
 
@@ -416,6 +430,17 @@ const CorrelationCard = React.memo(({ c }: { c: CorrelationCluster }) => {
         </span>
       </div>
       <p className="text-xs text-ink font-sans leading-snug">{c.description}</p>
+      {grade && (
+        <p className="text-micro text-ink-mute" title={`Counted one result per day. ${datesNote(grade.dates, grade.top3_date_share)}. This checks size of move, not direction or profit.`}>
+          Track record of this kind of alert: {familyVerdict(grade.verdict).text.toLowerCase()} ({datesNote(grade.dates, null)}).
+        </p>
+      )}
+      {others.length > 0 && (
+        <p className="text-micro text-ink-mute">
+          {others.length === 1 ? 'One more alert' : `${others.length} more alerts`} on this stock the same day: {others.map((o) => o.rule_name).join('; ')}.
+        </p>
+      )}
+      {directionNote(c.rule_name) && <p className="text-micro text-ink-mute">{directionNote(c.rule_name)}</p>}
       <DivergenceBrief situation={c.situation} brief={c.brief} id={c.correlation_id} measures={c} />
 
       {/* The first step of a loop that had every other step built: the
@@ -509,6 +534,8 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
     fetcher,
     { refreshInterval: POLL.standard },
   );
+  // The grades of each alert family, read once for the whole list.
+  const { data: producerGrades } = useSWR<{ clustered?: Clustered | null }>('/predictions/producer-grades', fetcher, { refreshInterval: POLL.slow, revalidateOnFocus: false, shouldRetryOnError: false });
   const shownAlerts = React.useMemo(() => filterAlerts(correlations ?? [], alertKind), [correlations, alertKind]);
 
   // Dynamic Event domain fetches
@@ -802,7 +829,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
                   {s.headline}
                 </h3>
                 <p className="text-micro text-ink-dim font-sans line-clamp-2 leading-tight">
-                  {s.narrative_summary}
+                  {withoutStaleConfidence(s.narrative_summary)}
                 </p>
                 <div className="pt-2 flex items-center justify-between text-micro text-ink-dim border-t border-line">
                   <span>
@@ -839,7 +866,7 @@ export default function IntelligenceFeed({ windowHours }: { windowHours?: number
                   (correlations && correlations.length > 0 ? 'No alerts of this kind right now.' : 'No correlation clusters yet.')}
               </div>
             ) : (
-              shownAlerts.map((c) => <CorrelationCard key={c.correlation_id} c={c} />)
+              foldAlerts(shownAlerts).map((f) => <CorrelationCard key={f.lead.correlation_id} c={f.lead} others={f.others} grades={producerGrades?.clustered} />)
             )}
           </div>
         </div>

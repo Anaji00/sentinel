@@ -6,23 +6,25 @@
  */
 
 import React from 'react';
-import useSWR from 'swr';
-import { fetcher } from '../lib/api';
-import { failedWithout } from '../lib/dataHealth';
+import { okData, sectionFailed } from '../lib/evidence';
+import { useEvidence } from '../lib/useEvidence';
 import { formatNumber } from '../lib/format';
-import { groupHeldBack, expectedMoveWords, heldBackKey, type HeldBackResponse } from '../lib/heldBack';
-import { POLL } from './ui/DataProvider';
+import { groupHeldBack, expectedMoveWords } from '../lib/heldBack';
 import { PanelError } from './ui/PanelError';
 import { LoadingLines } from './ui/Skeleton';
 
 export default function HeldBack({ ticker }: { ticker: string }) {
-  const { data, error } = useSWR<HeldBackResponse>(heldBackKey(ticker), fetcher, { refreshInterval: POLL.rare });
-  const groups = React.useMemo(() => groupHeldBack(data?.held_back), [data]);
+  const evidence = useEvidence(ticker);
+  const section = evidence.data?.sections.held_back;
+  // A source that has nothing to say is an empty list with its reason; a source that failed is an error.
+  const data = okData(section) ?? (section?.status === 'missing' ? { ticker, count: 0, note: section.note, held_back: [] } : undefined);
+  const failed = sectionFailed(section) || Boolean(evidence.error && !evidence.data);
+  const groups = groupHeldBack(data?.held_back);
 
   return (
     <section aria-label={`Signals held back on ${ticker}`} className="space-y-2 rounded-md border border-line bg-inset p-4">
       <h3 className="text-xs font-semibold uppercase tracking-[0.08em] text-ink-mute">Held back, last 45 days</h3>
-      {failedWithout(error, data) ? (
+      {failed ? (
         <PanelError what="the held-back signals" inline />
       ) : !data ? (
         <LoadingLines lines={2} label={`Loading signals held back on ${ticker}`} />

@@ -29,6 +29,8 @@ import 'leaflet/dist/leaflet.css';
 import type * as Leaflet from 'leaflet';
 import { fetcher } from '../lib/api';
 import { ABSENT, formatNumber } from '../lib/format';
+import { Disclosure } from './ui/Disclosure';
+import { arc, councilQuestion, trailLines, verdictHeadline, verdictLine, type VerdictPortal } from '../lib/watchlight';
 import {
   CourtCases,
   DataBrokers,
@@ -405,52 +407,78 @@ function NearStory({ near, onAgency }: { near: Near; onAgency: (name: string, st
   );
 }
 
+/** A figure inside a sentence that does something when pressed. A missing number shows a dash, never zero. */
+function Fig({ value, tone = 'text-accent', onClick, hint }: { value: number | null | undefined; tone?: string; onClick: () => void; hint: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={hint}
+      className={`font-mono font-semibold tabular-nums underline decoration-dotted underline-offset-4 hover:decoration-solid ${tone}`}
+    >
+      {value == null ? ABSENT : formatNumber(value, { decimals: 0 })}
+    </button>
+  );
+}
+
 function Welcome({ summary, onExplore }: { summary?: Summary; onExplore: (section: SectionId) => void }) {
-  const max = Math.max(1, ...(summary?.tech_by_type ?? []).map((c) => c.count));
+  const tech = (summary?.tech_by_type ?? []).slice(0, 8);
+  const max = Math.max(1, ...tech.map((c) => c.count));
+  const top = tech.slice(0, 3);
+  const vendors = (summary?.vendors ?? []).slice(0, 8);
+  const lead = vendors[0];
   return (
     <div className="space-y-4">
-      <header>
-        <h2 className="text-head font-semibold text-ink">Start with your town</h2>
-        <p className="text-sm text-ink-dim">
-          Search above, pick an agency dot, or click anywhere on the map. You&apos;ll see what watches that place, who runs
-          it, whether it follows the rules, who gets a say, and what you can do about it.
-        </p>
+      <header className="space-y-2">
+        <h2 className="text-head font-semibold text-ink">Pick a place</h2>
+        <p className="text-sm text-ink-dim">Search above, tap an agency dot, or tap anywhere on the map.</p>
       </header>
-      <section className="space-y-1.5">
-        <h3 className="text-xs font-semibold text-ink-dim">What police use most, by number of agencies</h3>
-        <ul className="space-y-1">
-          {(summary?.tech_by_type ?? []).slice(0, 8).map((c) => (
-            <li key={c.name} className="text-xs">
-              <div className="flex justify-between gap-2">
-                <span className="text-ink-dim truncate">{c.name}</span>
-                <span className="font-mono text-ink-mute">{formatNumber(c.count, { decimals: 0 })}</span>
-              </div>
-              <div className="h-1 rounded-full bg-inset overflow-hidden">
-                <div className="h-full bg-accent/70" style={{ width: `${(c.count / max) * 100}%` }} />
-              </div>
-            </li>
+      {top.length > 0 && (
+        <p className="text-sm leading-relaxed text-ink">
+          Police most often use {top.map((c, i) => (
+            <React.Fragment key={c.name}>
+              {i > 0 && (i === top.length - 1 ? ' and ' : ', ')}
+              {c.name.toLowerCase()} (<span className="font-mono font-semibold tabular-nums">{formatNumber(c.count, { decimals: 0 })}</span> agencies)
+            </React.Fragment>
           ))}
-        </ul>
-      </section>
-      <section className="space-y-1">
-        <h3 className="text-xs font-semibold text-ink-dim">The companies behind it</h3>
-        <p className="text-xs text-ink-mute">
-          {(summary?.vendors ?? [])
-            .slice(0, 8)
-            .map((v) => `${v.name} (${formatNumber(v.count, { decimals: 0 })})`)
-            .join(' · ') || ABSENT}
+          .{lead && (
+            <>
+              {' '}
+              <span className="font-semibold">{lead.name}</span> is behind <span className="font-mono font-semibold tabular-nums">{formatNumber(lead.count, { decimals: 0 })}</span> of the mapped devices.
+            </>
+          )}
         </p>
-      </section>
-      <div className="grid grid-cols-2 gap-2">
+      )}
+      <Disclosure variant="row" label="Everything police use, ranked" storageKey="civic:tech-ranking">
+        <div className="space-y-3 pt-1">
+          <ul className="space-y-1">
+            {tech.map((c) => (
+              <li key={c.name} className="text-xs">
+                <div className="flex justify-between gap-2">
+                  <span className="text-ink-dim truncate">{c.name}</span>
+                  <span className="font-mono text-ink-mute">{formatNumber(c.count, { decimals: 0 })}</span>
+                </div>
+                <div className="h-1 rounded-full bg-inset overflow-hidden">
+                  <div className="h-full bg-accent/70" style={{ width: `${(c.count / max) * 100}%` }} />
+                </div>
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-ink-mute">
+            {vendors.map((v) => `${v.name} (${formatNumber(v.count, { decimals: 0 })})`).join(' · ') || ABSENT}
+          </p>
+        </div>
+      </Disclosure>
+      <div className="flex flex-wrap gap-1.5">
         {SECTIONS.map((s) => (
           <button
             key={s.id}
             type="button"
+            title={s.blurb}
             onClick={() => onExplore(s.id)}
-            className="text-left rounded-lg border border-line bg-inset p-2.5 hover:border-line-accent hover:bg-overlay"
+            className="rounded-full border border-line px-3 py-1 text-xs text-ink-dim hover:border-accent hover:text-ink"
           >
-            <div className="text-xs font-semibold text-ink">{s.label}</div>
-            <div className="text-micro text-ink-mute leading-snug">{s.blurb}</div>
+            {s.label}
           </button>
         ))}
       </div>
@@ -659,9 +687,25 @@ export function CivicWatch() {
   const [section, setSection] = useState<SectionId>('feed');
   const [view, setView] = useState<string>('feed');
   const [state, setState] = useState<string>('');
+  const [trailOn, setTrailOn] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const trailLayer = useRef<Leaflet.LayerGroup | null>(null);
+  const trailOnRef = useRef(false);
+  const [more, setMore] = useState(false);
 
   const story = trail[trail.length - 1];
   const push = useCallback((s: Story, reset = false) => setTrail((t) => (reset ? [s] : [...t, s].slice(-6))), []);
+  const portalSlug = story?.kind === 'agency' ? (story.card.portal_slug ?? null) : story?.kind === 'portal' ? story.slug : null;
+  const { data: portal } = useSWR<VerdictPortal>(portalSlug ? `/civic/portal?slug=${encodeURIComponent(portalSlug)}` : null, fetcher);
+  const verdict = story?.kind === 'agency' ? verdictLine(story.card, portal) : null;
+  const headline = story?.kind === 'agency' ? verdictHeadline(story.card, portal) : null;
+  const question = story?.kind === 'agency' ? councilQuestion(story.card, portal) : null;
+  const nearVerdict =
+    story?.kind === 'near'
+      ? `${deviceWords(story.near.device_counts) || 'No mapped devices'} within ${story.near.radius_km} km, and ${plural(story.near.agencies.length, 'agency')} on record nearby.`
+      : null;
 
   // The sidebar's Civic entries open a section by hash.
   useEffect(() => {
@@ -686,12 +730,23 @@ export function CivicWatch() {
     window.dispatchEvent(new HashChangeEvent('hashchange'));
   }, []);
 
+  const showMap = useCallback(() => document.getElementById('civic-map')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), []);
+  const soloed = !(layers.ALPR && layers.gunshot_detector && layers.agencies && layers.oversight);
+  const showOversight = useCallback(() => {
+    setLayers({ ALPR: false, gunshot_detector: false, agencies: false, oversight: true });
+    showMap();
+  }, [showMap]);
+  const showAll = useCallback(() => setLayers({ ALPR: true, gunshot_detector: true, agencies: true, oversight: true }), []);
+
   const openAgency = useCallback(
     async (name: string, st: string, reset = false) => {
       setError(null);
       try {
         const card: ReportCard = await fetcher(`/civic/agency?name=${encodeURIComponent(name)}&state=${encodeURIComponent(st)}`);
         push({ kind: 'agency', card, label: card.agency }, reset);
+        setTrailOn(false);
+        setAsking(false);
+        setCopied(false);
         setState(card.state);
         if (card.lat != null && card.lon != null) mapRef.current?.flyTo([card.lat, card.lon], Math.max(mapRef.current.getZoom(), 11));
       } catch {
@@ -758,6 +813,8 @@ export function CivicWatch() {
       }).addTo(map);
       agencyLayer.current = L.layerGroup().addTo(map);
       deviceLayer.current = L.layerGroup().addTo(map);
+      map.createPane('trail').style.zIndex = '450';
+      trailLayer.current = L.layerGroup().addTo(map);
       map.on('moveend', () => void loadDevices());
       map.on('click', async (ev: Leaflet.LeafletMouseEvent) => {
         setError(null);
@@ -779,6 +836,57 @@ export function CivicWatch() {
     };
   }, [loadDevices, push]);
 
+  const locate = useCallback(() => {
+    if (!navigator.geolocation) {
+      setError('This browser cannot share a location. Search for your town instead.');
+      return;
+    }
+    setLocating(true);
+    setError(null);
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        try {
+          const near: Near = await fetcher(`/civic/near?lat=${latitude.toFixed(3)}&lon=${longitude.toFixed(3)}&radius_km=5`);
+          push({ kind: 'near', near, label: 'Near you' }, true);
+          mapRef.current?.flyTo([latitude, longitude], 12);
+        } catch {
+          setError("We couldn't read what watches your area.");
+        } finally {
+          setLocating(false);
+        }
+      },
+      () => {
+        setLocating(false);
+        setError('Your location was not shared. Search for your town instead.');
+      },
+      { timeout: 10000 },
+    );
+  }, [push]);
+
+  // The data trail: arcs from the picked department to every state its plate data is shared with.
+  useEffect(() => {
+    const L = LRef.current;
+    const layer = trailLayer.current;
+    const map = mapRef.current;
+    if (!mapReady || !L || !layer || !map) return;
+    layer.clearLayers();
+    const origin: [number, number] | null = story?.kind === 'agency' && story.card.lat != null && story.card.lon != null ? [story.card.lat, story.card.lon] : null;
+    if (origin) {
+      const dot = document.createElement('span');
+      dot.className = 'watch-pulse';
+      L.marker(origin, { icon: L.divIcon({ className: '', html: dot, iconSize: [16, 16], iconAnchor: [8, 8] }), interactive: false, keyboard: false }).addTo(layer);
+    }
+    if (!trailOn || !origin || !portal) return;
+    const lines = trailLines(portal.shared_by_state);
+    for (const l of lines) {
+      L.polyline(arc(origin, l.to), { pane: 'trail', renderer: L.svg({ pane: 'trail' }), color: '#a5b4fc', weight: 1 + Math.min(5, Math.log2(l.count + 1)), opacity: 0.85 })
+        .bindTooltip(`${plural(l.count, 'agency')} in ${l.state}`)
+        .addTo(layer);
+    }
+    if (lines.length > 0) map.flyToBounds(L.latLngBounds([origin, ...lines.map((l) => l.to)]), { padding: [50, 50], maxZoom: 6 });
+  }, [trailOn, portal, story, mapReady]);
+
   const covered = useMemo(() => {
     const s = new Set<string>();
     for (const l of oversight?.laws ?? []) for (const a of l.agencies) s.add(`${a.agency}|${a.state}`);
@@ -788,6 +896,7 @@ export function CivicWatch() {
   // Agencies, once they and the map are ready; redrawn when a layer toggles.
   useEffect(() => {
     layersRef.current = layers;
+    trailOnRef.current = trailOn;
     const L = LRef.current;
     const layer = agencyLayer.current;
     if (!mapReady || !L || !layer) return;
@@ -801,7 +910,7 @@ export function CivicWatch() {
         color: layers.oversight && watched ? '#34d399' : intensityColor(a.intensity),
         fillColor: intensityColor(a.intensity),
         weight: layers.oversight && watched ? 2.5 : 1,
-        fillOpacity: 0.4,
+        fillOpacity: trailOnRef.current ? 0.12 : 0.4,
       })
         .bindTooltip(`${a.agency} (${a.state}): ${a.technologies.join(', ')}${watched ? ' · local oversight law' : ''}`)
         .on('click', (ev: Leaflet.LeafletMouseEvent) => {
@@ -811,7 +920,7 @@ export function CivicWatch() {
         .addTo(layer);
     }
     void loadDevices();
-  }, [agencyData, covered, layers, mapReady, openAgency, loadDevices]);
+  }, [agencyData, covered, layers, mapReady, openAgency, loadDevices, trailOn]);
 
   const t = summary?.totals;
   const conflicts = (legal?.counts ?? []).filter((c) => c.severity === 'conflict').reduce((a, c) => a + c.n, 0);
@@ -828,97 +937,171 @@ export function CivicWatch() {
       {/* Dark tiles in the dark theme: the light basemap was the brightest thing
           on the page and competed with the dots. Inverting and turning the hue
           back keeps water blue-ish and land dark, with no second tile source. */}
-      <style>{`.civic-tiles{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.45)}:root[data-theme="light"] .civic-tiles{filter:saturate(.8)}.leaflet-container{background:var(--bg-inset)}`}</style>
+      <style>{`.watch-pulse{display:block;width:16px;height:16px;border-radius:9999px;background:#a5b4fc;border:2px solid #fff;animation:watch-pulse 1.8s infinite}@keyframes watch-pulse{0%{box-shadow:0 0 0 0 rgba(165,180,252,.7)}70%{box-shadow:0 0 0 20px rgba(165,180,252,0)}100%{box-shadow:0 0 0 0 rgba(165,180,252,0)}}@media (prefers-reduced-motion:reduce){.watch-pulse{animation:none}}.civic-tiles{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.45)}:root[data-theme="light"] .civic-tiles{filter:saturate(.8)}.leaflet-container{background:var(--bg-inset)}`}</style>
 
-      <header className="rounded-md border border-line bg-raised p-5 space-y-4 bg-[radial-gradient(ellipse_70%_120%_at_0%_0%,var(--accent-dim),transparent)]">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="space-y-1 max-w-2xl">
-            <h1 className="text-lead font-semibold text-ink">Who&apos;s watching your town?</h1>
-            <p className="text-sm text-ink-dim">
-              Plate readers, gunshot microphones, face recognition and drones, mapped from public records and volunteer
-              surveys. See who runs them, whether they follow the rules, and what you can do. Nothing here looks up a
-              person or a plate.
-            </p>
+      <section id="civic-map" aria-label="Watchlight map" className="relative isolate h-[82vh] min-h-[540px] overflow-hidden rounded-md border border-line">
+        <div ref={mapEl} className="absolute inset-0" />
+
+        {story && (
+          <button
+            type="button"
+            onClick={() => setTrail([])}
+            className="absolute left-3 top-3 z-[500] rounded-full border border-line bg-overlay/95 px-3 py-1.5 text-xs text-ink shadow-overlay md:hidden"
+          >
+            ← Search another place
+          </button>
+        )}
+        <div className={`absolute inset-x-3 top-3 z-[500] max-w-xl space-y-3 rounded-lg border border-line bg-overlay/95 p-4 shadow-overlay ${story ? 'hidden md:block' : ''}`}>
+          <p className="text-micro font-semibold uppercase tracking-[0.18em] text-accent">Watchlight</p>
+          <h1 className="text-lead font-semibold leading-tight text-ink">{story ? 'Looking somewhere else?' : 'Where do you live?'}</h1>
+          <PlaceFinder agencies={agencyData?.agencies ?? []} onPick={(a) => void openAgency(a.agency, a.state, true)} initial={townParam} />
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <button
+              type="button"
+              onClick={locate}
+              disabled={locating}
+              className="rounded-full border border-accent px-3 py-1 text-xs text-ink hover:bg-accent-dim disabled:opacity-60"
+            >
+              {locating ? 'Finding you…' : 'Use my location'}
+            </button>
+            <span className="text-micro text-ink-mute">or tap anywhere on the map. Your location is used once to look up what is nearby.</span>
           </div>
-          <PlaceFinder
-            agencies={agencyData?.agencies ?? []}
-            onPick={(a) => void openAgency(a.agency, a.state, true)}
-            initial={townParam}
-          />
+          {!story && (
+            <p className="text-sm leading-relaxed text-ink">
+              Volunteers have mapped <Fig value={t?.devices} onClick={showMap} hint="Look at the map" /> cameras and sensors run by{' '}
+              <Fig value={t?.agencies} onClick={showMap} hint="Look at the map" /> agencies.{' '}
+              <Fig value={conflicts} tone="text-negative" onClick={() => explore('accountability', 'findings')} hint="See the possible violations" />{' '}
+              may be breaking their own rules, and only{' '}
+              <Fig value={oversight?.covered_agencies} tone="text-positive" onClick={showOversight} hint="Show only agencies with an oversight law" />{' '}
+              answer to a local oversight law.
+              {soloed && (
+                <>
+                  {' '}
+                  <button type="button" onClick={showAll} className="text-sm text-accent underline underline-offset-2">
+                    Show everything again
+                  </button>
+                </>
+              )}
+            </p>
+          )}
+          {error && <p className="text-xs text-negative">{error}</p>}
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-          <Stat value={t?.devices} label="cameras and sensors mapped by volunteers" />
-          <Stat value={t?.agencies} label="agencies with documented surveillance" />
-          <Stat value={conflicts} label="possible legal violations to ask about" tone="text-negative" />
-          <Stat value={oversight?.covered_agencies} label="agencies that answer to a local oversight law" tone="text-positive" />
-        </div>
-      </header>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_420px] gap-4">
-        {/* `isolate`: Leaflet's panes and controls carry z-index 400-1000,
-            which outranked every dialog (z-50) and the phone nav drawer (z-40)
-            -- Platform health opened underneath the map. Its own stacking
-            context keeps those numbers inside the map, where the legend's
-            z-[500] still sits above the tiles. */}
-        <div className="relative isolate rounded-md border border-line overflow-hidden h-[68vh] min-h-[480px]">
-          <div ref={mapEl} className="absolute inset-0" />
-          <div className="absolute left-3 top-3 z-[500] rounded-md border border-line bg-overlay/95 p-2.5 text-xs space-y-1.5 shadow-overlay">
-            <div className="text-micro uppercase tracking-wider text-ink-mute">On the map</div>
+        {(verdict || nearVerdict) && (
+          <div aria-live="polite" className="absolute inset-x-3 bottom-3 z-[500] space-y-2.5 rounded-lg border border-line bg-overlay/95 p-4 shadow-overlay md:left-auto md:w-[26rem]">
+            {story?.kind === 'agency' && (
+              <>
+                <div className="flex items-start justify-between gap-2">
+                  <h2 className="text-head font-semibold leading-tight text-ink">{story.card.agency}</h2>
+                  <MakeMyTown agency={story.card.agency} state={story.card.state} />
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-inset">
+                    <div className="h-full rounded-full" style={{ width: `${Math.min(100, (story.card.intensity / Math.max(1, story.card.max_intensity)) * 100)}%`, background: intensityColor(story.card.intensity) }} />
+                  </div>
+                  <span className="text-micro text-ink-dim">{intensityWord(story.card.intensity)} surveillance</span>
+                </div>
+              </>
+            )}
+            {headline && <p className="text-lg font-semibold leading-snug text-ink">{headline}</p>}
+            <p className={`text-sm leading-relaxed ${headline ? 'text-ink-dim' : 'text-ink'} ${headline && !more ? 'hidden md:block' : ''}`}>{verdict ?? nearVerdict}</p>
+            {headline && (
+              <button type="button" onClick={() => setMore((v) => !v)} className="text-micro text-accent underline underline-offset-2 md:hidden">
+                {more ? 'Less' : 'More about this place'}
+              </button>
+            )}
+            {story?.kind === 'agency' && (
+              <div className="flex flex-wrap gap-1.5">
+                {trailLines(portal?.shared_by_state).length > 0 && (
+                  <button
+                    type="button"
+                    aria-pressed={trailOn}
+                    onClick={() => setTrailOn((v) => !v)}
+                    className={`rounded-full border px-3 py-1 text-xs ${trailOn ? 'border-accent bg-accent-dim text-ink' : 'border-line text-ink-dim hover:border-accent hover:text-ink'}`}
+                  >
+                    {trailOn ? 'Hide the data trail' : 'Show where the data goes'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  aria-pressed={asking}
+                  onClick={() => setAsking((v) => !v)}
+                  className={`rounded-full border px-3 py-1 text-xs ${asking ? 'border-accent bg-accent-dim text-ink' : 'border-line text-ink-dim hover:border-accent hover:text-ink'}`}
+                >
+                  Ask your council
+                </button>
+                <button type="button" onClick={() => document.getElementById('civic-deeper')?.scrollIntoView({ behavior: 'smooth' })} className="rounded-full border border-line px-3 py-1 text-xs text-ink-dim hover:border-accent hover:text-ink">
+                  The full picture ↓
+                </button>
+              </div>
+            )}
+            {story?.kind === 'agency' && asking && question && (
+              <div className="space-y-1.5">
+                <textarea readOnly rows={7} value={question} className="w-full rounded-md border border-line bg-inset p-2 text-xs text-ink-dim" aria-label="A question for your council, drafted for you" />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard
+                        ?.writeText(question)
+                        .then(() => setCopied(true))
+                        .catch(() => setCopied(false));
+                    }}
+                    className="rounded-full border border-accent px-3 py-1 text-xs text-ink hover:bg-accent-dim"
+                  >
+                    {copied ? 'Copied' : 'Copy the question'}
+                  </button>
+                  <span className="text-micro text-ink-mute">A draft only. Nothing is sent: you send it.</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <details className={`absolute bottom-3 left-3 z-[500] rounded-md border border-line bg-overlay/95 text-xs shadow-overlay ${story ? 'hidden md:block' : ''}`}>
+          <summary className="cursor-pointer select-none px-2.5 py-1.5 text-ink-dim hover:text-ink">Layers</summary>
+          <div className="space-y-1.5 border-t border-line p-2.5">
             {toggles.map(([k, label, color]) => (
-              <label key={k} className="flex items-center gap-2 cursor-pointer text-ink-dim hover:text-ink">
-                <input
-                  type="checkbox"
-                  checked={layers[k]}
-                  onChange={(e) => setLayers((l) => ({ ...l, [k]: e.target.checked }))}
-                  className="accent-[var(--accent)]"
-                />
+              <label key={k} className="flex cursor-pointer items-center gap-2 text-ink-dim hover:text-ink">
+                <input type="checkbox" checked={layers[k]} onChange={(e) => setLayers((l) => ({ ...l, [k]: e.target.checked }))} className="accent-[var(--accent)]" />
                 <span className="h-2.5 w-2.5 rounded-full" style={{ background: color }} />
                 {label}
               </label>
             ))}
-            <div className="pt-1 text-micro text-ink-mute">Bigger, redder dots: more invasive tools.</div>
+            <div className="text-micro text-ink-mute">Bigger, redder dots: more invasive tools.</div>
+            {deviceNote && <div className="text-micro text-ink-mute">{deviceNote}</div>}
           </div>
-          {deviceNote && (
-            <div className="absolute left-3 bottom-3 z-[500] rounded-lg bg-overlay/95 border border-line px-2.5 py-1 text-micro text-ink-dim">
-              {deviceNote}
-            </div>
-          )}
-        </div>
+        </details>
+      </section>
 
-        <aside className="rounded-md border border-line bg-raised p-4 overflow-y-auto h-[68vh] min-h-[480px]" aria-live="polite">
-          {trail.length > 0 && (
-            <nav aria-label="Trail" className="mb-3 flex flex-wrap items-center gap-1 text-micro text-ink-mute">
-              <button type="button" onClick={() => setTrail([])} className="hover:text-accent">
-                Start
-              </button>
-              {trail.map((s, i) => (
-                <React.Fragment key={i}>
-                  <span>/</span>
-                  <button
-                    type="button"
-                    onClick={() => setTrail((tr) => tr.slice(0, i + 1))}
-                    className={`truncate max-w-[10rem] ${i === trail.length - 1 ? 'text-ink' : 'hover:text-accent'}`}
-                  >
-                    {s.label}
-                  </button>
-                </React.Fragment>
-              ))}
-            </nav>
-          )}
-          {error && <p className="mb-2 text-xs text-negative">{error}</p>}
-          {!story ? (
-            <Welcome summary={summary} onExplore={(s) => explore(s)} />
-          ) : story.kind === 'near' ? (
-            <NearStory near={story.near} onAgency={(n, st) => void openAgency(n, st)} />
-          ) : story.kind === 'agency' ? (
-            <AgencyStory card={story.card} onOpenPortal={openPortal} onExplore={explore} />
-          ) : (
-            <div className="text-xs space-y-3">
-              <PortalPanel slug={story.slug} />
-            </div>
-          )}
-        </aside>
-      </div>
+      <section id="civic-deeper" aria-label="The full picture" className="rounded-md border border-line bg-raised p-4" aria-live="polite">
+        {trail.length > 0 && (
+          <nav aria-label="Trail" className="mb-3 flex flex-wrap items-center gap-1 text-micro text-ink-mute">
+            <button type="button" onClick={() => setTrail([])} className="hover:text-accent">
+              Start
+            </button>
+            {trail.map((s, i) => (
+              <React.Fragment key={i}>
+                <span>/</span>
+                <button type="button" onClick={() => setTrail((tr) => tr.slice(0, i + 1))} className={`max-w-[10rem] truncate ${i === trail.length - 1 ? 'text-ink' : 'hover:text-accent'}`}>
+                  {s.label}
+                </button>
+              </React.Fragment>
+            ))}
+          </nav>
+        )}
+        {!story ? (
+          <Welcome summary={summary} onExplore={(s) => explore(s)} />
+        ) : story.kind === 'near' ? (
+          <NearStory near={story.near} onAgency={(n, st) => void openAgency(n, st)} />
+        ) : story.kind === 'agency' ? (
+          <AgencyStory card={story.card} onOpenPortal={openPortal} onExplore={explore} />
+        ) : (
+          <div className="space-y-3 text-xs">
+            <PortalPanel slug={story.slug} />
+          </div>
+        )}
+      </section>
 
       <Explore
         section={section}
